@@ -359,23 +359,35 @@ class TrackmaniaInterface:
 
     def parse_observation(
         self,
-        obs: np.ndarray,
+        obs,
         action: Optional[np.ndarray] = None,
     ) -> TelemetryFrame:
         """
-        Build a TelemetryFrame from a raw obs array + the action that was sent.
+        Build a TelemetryFrame from a raw obs + the action that was sent.
+
+        tmrl 0.7+ returns obs as a tuple of arrays, e.g.:
+            obs[0] = np.array([speed_ms, gear, rpm, ...])   ← scalar telemetry
+            obs[1] = np.array([...])                         ← LIDAR / images
+        Older versions return a single flat np.ndarray.
         Edit the index mapping here if your tmrl config differs.
         """
         if action is None:
             action = self._last_action
 
-        speed_ms  = float(obs[0]) if obs.shape[0] > 0 else 0.0
-        gear      = int(obs[1])   if obs.shape[0] > 1 else 0
-        rpm       = float(obs[2]) if obs.shape[0] > 2 else 0.0
+        # Flatten tuple obs → take the first array (scalar telemetry)
+        if isinstance(obs, (tuple, list)):
+            flat = np.asarray(obs[0], dtype=np.float32).ravel()
+        else:
+            flat = np.asarray(obs, dtype=np.float32).ravel()
 
-        steering  = float(np.clip(action[0], -1.0,  1.0)) if action.shape[0] > 0 else 0.0
-        throttle  = float(np.clip(action[1],  0.0,  1.0)) if action.shape[0] > 1 else 0.0
-        brake     = float(np.clip(action[2],  0.0,  1.0)) if action.shape[0] > 2 else 0.0
+        speed_ms = float(flat[0]) if len(flat) > 0 else 0.0
+        gear     = int(flat[1])   if len(flat) > 1 else 0
+        rpm      = float(flat[2]) if len(flat) > 2 else 0.0
+
+        action = np.asarray(action, dtype=np.float32).ravel()
+        steering = float(np.clip(action[0], -1.0,  1.0)) if len(action) > 0 else 0.0
+        throttle = float(np.clip(action[1],  0.0,  1.0)) if len(action) > 1 else 0.0
+        brake    = float(np.clip(action[2],  0.0,  1.0)) if len(action) > 2 else 0.0
 
         frame = TelemetryFrame(
             timestamp = time.time(),
