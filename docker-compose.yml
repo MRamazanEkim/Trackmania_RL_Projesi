@@ -5,8 +5,6 @@
 #   docker-compose up tensorboard     # Start TensorBoard only
 #   docker-compose --profile dev up   # Start with development tools
 
-version: "3.9"
-
 services:
   # ── Main Training Service ───────────────────────────────────────────────────
   trainer:
@@ -35,6 +33,12 @@ services:
     # Network mode: host required for tmrl socket communication
     network_mode: host
 
+    # uinput device for virtual gamepad (vgamepad/libevdev)
+    # Requires uinput kernel module: run `sudo modprobe uinput` in WSL2 if missing
+    privileged: true
+    devices:
+      - /dev/uinput:/dev/uinput
+
     # GPU support (uncomment if using NVIDIA GPU)
     # deploy:
     #   resources:
@@ -48,14 +52,18 @@ services:
 
   # ── TensorBoard Monitoring ──────────────────────────────────────────────────
   tensorboard:
-    image: tensorflow/tensorflow:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
     container_name: trackmania-tensorboard
     restart: unless-stopped
     ports:
       - "6006:6006"
     volumes:
-      - checkpoints:/logs:ro
-    command: tensorboard --logdir=/logs --host=0.0.0.0 --port=6006
+      - telemetry_logs:/app/telemetry_logs:ro
+      - checkpoints:/app/checkpoints:ro
+    command: python -m tensorboard.main --logdir=/app/telemetry_logs --host=0.0.0.0 --port=6006
 
   # ── Development Environment ─────────────────────────────────────────────────
   dev:

@@ -11,17 +11,28 @@ ENV PYTHONUNBUFFERED=1
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    libgl1-mesa-glx \
-    libglib2.0-0 \
-    libsm6 \
-    libxext6 \
-    libxrender-dev \
-    libgomp1 \
-    git \
-    && rm -rf /var/lib/apt/lists/*
+# Install system dependencies (with retry logic for transient network failures)
+RUN echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/80retries && \
+    echo 'Acquire::http::Timeout "30";' >> /etc/apt/apt.conf.d/80retries && \
+    echo 'Acquire::ftp::Timeout "30";' >> /etc/apt/apt.conf.d/80retries && \
+    for i in 1 2 3; do \
+        apt-get update && \
+        apt-get install -y --no-install-recommends --fix-missing \
+            build-essential \
+            libgl1 \
+            libglib2.0-0 \
+            libsm6 \
+            libxext6 \
+            libxrender-dev \
+            libgomp1 \
+            libevdev2 \
+            git \
+        && break || { \
+            echo "apt-get attempt $i failed"; \
+            [ "$i" -lt 3 ] && sleep 10 || { echo "All apt-get attempts failed"; exit 1; }; \
+        }; \
+    done && \
+    rm -rf /var/lib/apt/lists/*
 
 # ── Dependencies Stage ────────────────────────────────────────────────────────
 FROM base as dependencies
