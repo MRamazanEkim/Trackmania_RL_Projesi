@@ -28,16 +28,28 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 
 import numpy as np
 from rich import box
 from rich.console import Console
 from rich.live import Live
 from rich.panel import Panel
+from rich.table import Table
 from rich.text import Text
 
 console = Console()
+
+# Import AI driving logic components
+try:
+    from ai_driving_logic import (
+        DrivingController,
+        AdaptiveRewardSystem,
+        FailureInfo,
+    )
+    AI_DRIVING_AVAILABLE = True
+except ImportError:
+    AI_DRIVING_AVAILABLE = False
 
 # ── tmrl raw data[] layout ────────────────────────────────────────────────────
 # Position is NOT in the obs tuple; it lives in the raw data[] array that
@@ -212,6 +224,7 @@ class TelemetryDashboard:
         log_path:   Optional[Path] = None,
         log_frames: int = 0,
         tracker=None,                  # Optional[ProgressTracker]
+        adaptive_reward=None,          # Optional[AdaptiveRewardSystem]
     ) -> Panel:
         if self._frame is None:
             return Panel(
@@ -256,6 +269,18 @@ class TelemetryDashboard:
                 f"  [dim]waypoint {tracker.furthest_idx:,} / {tracker.total_waypoints:,}"
                 f"   Σreward {tracker.cumulative_reward:,.1f}[/]",
                 f"  [dim]pos  X {f.x:8.1f}  Y {f.y:8.1f}  Z {f.z:8.1f}[/]",
+            ]
+
+        # ── adaptive reward info (if AI logic enabled) ───────────────────
+        if adaptive_reward is not None:
+            pb = adaptive_reward.personal_best
+            threshold = adaptive_reward.current_threshold
+            pb_color = "green" if pct > pb else "yellow"
+            lines += [
+                "",
+                f"  [bold blue]AI TARGETS[/]",
+                f"  [dim]Personal Best:[/] [{pb_color}]{pb:5.1f}%[/]  "
+                f"[dim]Threshold:[/] [cyan]{threshold:5.1f}%[/]",
             ]
 
         lines += [
@@ -471,8 +496,10 @@ def run(
     output_dir:      str                              = "telemetry_logs",
     reward_fn:       Callable[[TelemetryFrame], float] = calculate_reward,
     max_episodes:    Optional[int]                    = None,
-    trajectory_path: Optional[str]                   = None,
+    trajectory_path: Optional[str]                    = None,
     wp_spacing:      float                            = 1.0,
+    enable_ai_logic: bool                             = True,
+    history_file:    Optional[str]                    = None,
 ):
     """
     Connect, log, and display telemetry until Ctrl-C or max_episodes is reached.
@@ -482,6 +509,8 @@ def run(
                          When provided, reward comes from ProgressTracker instead
                          of reward_fn.  Generate one with record_trajectory.py.
         wp_spacing:      Waypoint spacing used if trajectory needs pre-processing.
+        enable_ai_logic: Enable AI driving logic (failure detection + adaptive rewards).
+        history_file:    Path to save episode history for adaptive reward system.
     """
     # ── optional progress tracker ────────────────────────────────────────
     tracker = None
@@ -504,6 +533,31 @@ def run(
         # replace reward_fn with the tracker's signal
         def reward_fn(frame: TelemetryFrame) -> float:  # noqa: F811
             return tracker.update(frame.x, frame.y, frame.z)
+
+    # ── AI Driving Logic (failure detection + adaptive rewards) ──────────
+    driving_controller = None
+    adaptive_reward = None
+
+    if enable_ai_logic and AI_DRIVING_AVAILABLE:
+        driving_controller = DrivingController(
+            zero_speed_threshold=5.0,    # km/h - bunun altinda "durmus" sayilir
+            zero_speed_timeout=3.0,      # saniye - bu kadar duruk kalirsa fail
+            reverse_threshold=-0.3,       # dot product esigi (geri gitme)
+            stuck_timeout=10.0,          # saniye - ilerleme yoksa fail
+        )
+        adaptive_reward = AdaptiveRewardSystem(
+            history_file=history_file or "episode_history.json",
+            milestone_interval=50,       # Her 50 waypoint'te bonus
+            milestone_bonus=5.0,
+            pb_bonus_multiplier=2.0,     # Personal best asildiginda 2x bonus
+        )
+        console.print(
+            f"[green]AI Driving Logic enabled:[/] "
+            f"PB={adaptive_reward.personal_best:.1f}%, "
+            f"Threshold={adaptive_reward.current_threshold:.1f}%"
+        )
+    elif enable_ai_logic and not AI_DRIVING_AVAILABLE:
+        console.print("[yellow]Warning: ai_driving_logic module not found. Running without AI logic.[/]")
 
     interface = TrackmaniaInterface(reward_fn=reward_fn)
     logger    = TelemetryLogger(output_dir=output_dir, fmt=log_format)
@@ -533,9 +587,19 @@ def run(
                 if tracker is not None:
                     tracker.reset()
 
+                # Reset AI driving components
+                if driving_controller is not None:
+                    driving_controller.reset()
+                if adaptive_reward is not None:
+                    adaptive_reward.start_episode()
+
                 episode    += 1
                 terminated  = truncated = False
                 action      = np.zeros(3, dtype=np.float32)
+                failure_reason = ""
+                episode_reward = 0.0
+
+                console.print(f"\n[cyan]Episode {episode} started[/]")
 
                 while not (terminated or truncated):
                     obs, _env_reward, terminated, truncated, _info = interface.step(action)
@@ -543,15 +607,71 @@ def run(
                         break
 
                     frame = interface.parse_observation(obs, action)
+
+                    # ── AI Driving Logic: Failure Detection ──────────────
+                    if driving_controller is not None:
+                        progress = tracker.progress_pct if tracker else 0.0
+                        failure_info = driving_controller.check_failure(
+                            speed_kmh=frame.speed_kmh,
+                            position=np.array([frame.x, frame.y, frame.z]),
+                            progress=progress,
+                        )
+
+                        if failure_info.is_failed:
+                            terminated = True
+                            failure_reason = failure_info.reason
+                            console.print(
+                                f"[red]Episode failed: {failure_reason}[/] "
+                                f"[dim]({failure_info.details})[/]"
+                            )
+
+                    # ── AI Driving Logic: Adaptive Reward ────────────────
+                    if adaptive_reward is not None and tracker is not None:
+                        progress = tracker.progress_pct
+                        base_reward = frame.reward
+                        total_reward, breakdown = adaptive_reward.calculate_reward(
+                            progress=progress,
+                            base_reward=base_reward,
+                            is_done=terminated or truncated,
+                            failure_reason=failure_reason,
+                        )
+                        frame.reward = total_reward
+                        episode_reward += total_reward
+
                     logger.log(frame)
                     dashboard.update(frame)
-                    live.update(dashboard.render(log_path, logger.frame_count, tracker))
+                    live.update(dashboard.render(
+                        log_path, logger.frame_count, tracker,
+                        adaptive_reward=adaptive_reward
+                    ))
 
                     # ╔══════════════════════════════════════════════════╗
                     # ║  PLUG YOUR POLICY / AGENT HERE                  ║
                     # ║  action = my_agent.act(obs)                     ║
                     # ╚══════════════════════════════════════════════════╝
                     action = np.zeros(3, dtype=np.float32)  # coast (no-op)
+
+                # ── Episode End ──────────────────────────────────────────
+                if adaptive_reward is not None:
+                    max_progress = tracker.progress_pct if tracker else 0.0
+                    result = adaptive_reward.end_episode(
+                        max_progress=max_progress,
+                        total_reward=episode_reward,
+                        failure_reason=failure_reason,
+                    )
+
+                    # Episode summary
+                    if result.get("pb_broken"):
+                        console.print(
+                            f"[bold green]NEW PERSONAL BEST![/] "
+                            f"{result['personal_best']:.1f}%"
+                        )
+                    console.print(
+                        f"[dim]Episode {episode} complete: "
+                        f"Progress={result.get('max_progress', 0):.1f}%, "
+                        f"Reward={result.get('total_reward', 0):.1f}, "
+                        f"Duration={result.get('duration', 0):.1f}s[/]"
+                    )
 
     except KeyboardInterrupt:
         console.print("\n[yellow]Stopped by user.[/]")
@@ -561,6 +681,19 @@ def run(
     finally:
         logger.stop()
         interface.close()
+
+        # Final summary
+        if adaptive_reward is not None:
+            console.print("\n" + "=" * 50)
+            console.print("[bold cyan]Session Summary[/]")
+            console.print(f"  Episodes completed: {episode}")
+            console.print(f"  Personal Best: {adaptive_reward.personal_best:.1f}%")
+            console.print(f"  Current Threshold: {adaptive_reward.current_threshold:.1f}%")
+            stats = adaptive_reward.recent_stats
+            if stats:
+                console.print(f"  Avg Progress (recent): {stats['avg_progress']:.1f}%")
+            console.print("=" * 50)
+
         console.print(
             f"[bold green]Session complete.[/]  "
             f"{logger.frame_count:,} frames logged → {log_path}"
@@ -596,6 +729,14 @@ def _parse_args() -> argparse.Namespace:
         "--spacing", type=float, default=1.0,
         help="Waypoint spacing in metres when auto-processing a raw trajectory (default: 1.0)",
     )
+    p.add_argument(
+        "--no-ai-logic", action="store_true",
+        help="Disable AI driving logic (failure detection + adaptive rewards)",
+    )
+    p.add_argument(
+        "--history-file", default=None, metavar="JSON",
+        help="Path to episode history file for adaptive rewards (default: episode_history.json)",
+    )
     return p.parse_args()
 
 
@@ -607,4 +748,6 @@ if __name__ == "__main__":
         max_episodes    = args.episodes,
         trajectory_path = args.trajectory,
         wp_spacing      = args.spacing,
+        enable_ai_logic = not args.no_ai_logic,
+        history_file    = args.history_file,
     )

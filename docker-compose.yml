@@ -1,0 +1,116 @@
+# Trackmania RL Docker Compose Configuration
+# ============================================
+# Usage:
+#   docker-compose up -d              # Start training environment
+#   docker-compose up tensorboard     # Start TensorBoard only
+#   docker-compose --profile dev up   # Start with development tools
+
+version: "3.9"
+
+services:
+  # ── Main Training Service ───────────────────────────────────────────────────
+  trainer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: trackmania-rl-trainer
+    restart: unless-stopped
+
+    volumes:
+      # Mount source code for live updates
+      - .:/app
+      # Persist training data
+      - telemetry_logs:/app/telemetry_logs
+      - trajectories:/app/trajectories
+      - checkpoints:/app/checkpoints
+      # Mount tmrl config from host (if exists)
+      - ${USERPROFILE:-~}/TmrlData:/root/TmrlData:ro
+
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TMRL_CONFIG_PATH=/root/TmrlData
+      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+
+    # Network mode: host required for tmrl socket communication
+    network_mode: host
+
+    # GPU support (uncomment if using NVIDIA GPU)
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+    command: python telemetry_monitor.py --format csv
+
+  # ── TensorBoard Monitoring ──────────────────────────────────────────────────
+  tensorboard:
+    image: tensorflow/tensorflow:latest
+    container_name: trackmania-tensorboard
+    restart: unless-stopped
+    ports:
+      - "6006:6006"
+    volumes:
+      - checkpoints:/logs:ro
+    command: tensorboard --logdir=/logs --host=0.0.0.0 --port=6006
+
+  # ── Development Environment ─────────────────────────────────────────────────
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development
+    container_name: trackmania-rl-dev
+    profiles:
+      - dev
+
+    volumes:
+      - .:/app
+      - telemetry_logs:/app/telemetry_logs
+      - trajectories:/app/trajectories
+      - checkpoints:/app/checkpoints
+      - ${USERPROFILE:-~}/TmrlData:/root/TmrlData:ro
+
+    environment:
+      - PYTHONUNBUFFERED=1
+
+    network_mode: host
+    stdin_open: true
+    tty: true
+
+    command: bash
+
+  # ── Trajectory Recording Service ────────────────────────────────────────────
+  recorder:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: trackmania-recorder
+    profiles:
+      - record
+
+    volumes:
+      - .:/app
+      - trajectories:/app/trajectories
+      - ${USERPROFILE:-~}/TmrlData:/root/TmrlData:ro
+
+    network_mode: host
+
+    command: >
+      python record_trajectory.py
+      --output /app/trajectories/raw_trajectory.csv
+      --process
+      --spacing 1.0
+
+# ── Named Volumes ─────────────────────────────────────────────────────────────
+volumes:
+  telemetry_logs:
+    driver: local
+  trajectories:
+    driver: local
+  checkpoints:
+    driver: local
