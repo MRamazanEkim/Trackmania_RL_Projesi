@@ -39,6 +39,15 @@ from rich.text import Text
 
 console = Console()
 
+# ── tmrl raw data[] layout ────────────────────────────────────────────────────
+# Position is NOT in the obs tuple; it lives in the raw data[] array that
+# tmrl's interface reads from the OpenPlanet socket.  We monkey-patch the
+# interface to store the last data[] so we can read x, y, z from it.
+# Indices confirmed from tmrl/custom/tm/tm_gym_interfaces.py:
+DATA_IDX_X: int = 2
+DATA_IDX_Y: int = 3
+DATA_IDX_Z: int = 4
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Data model
@@ -54,6 +63,9 @@ class TelemetryFrame:
     steering: float    # –1.0 (full left) … +1.0 (full right)
     throttle: float    # 0.0 … 1.0
     brake: float       # 0.0 … 1.0
+    x: float  = 0.0   # world-space position (metres)
+    y: float  = 0.0
+    z: float  = 0.0
     reward: float = 0.0
 
 
@@ -63,18 +75,14 @@ class TelemetryFrame:
 
 def calculate_reward(frame: TelemetryFrame) -> float:
     """
-    Placeholder reward function.  Replace the body with your own logic.
+    Fallback speed-based reward — used only when no ProgressTracker is active.
 
-    Ideas
-    -----
-    - Reward forward speed:          speed_kmh / 300
-    - Penalise excessive steering:   –abs(steering) * k
-    - Penalise hard braking:         –brake * k
-    - Add track-progress signal from info dict in TrackmaniaInterface.step()
+    When a reference trajectory is loaded (--trajectory flag), the main loop
+    calls ProgressTracker.update(x, y, z) instead and ignores this function.
     """
-    speed_reward    =  frame.speed_kmh / 300.0        # normalised to [0, 1]
-    steering_cost   = -abs(frame.steering) * 0.10
-    brake_cost      = -frame.brake         * 0.20
+    speed_reward  =  frame.speed_kmh / 300.0
+    steering_cost = -abs(frame.steering) * 0.10
+    brake_cost    = -frame.brake         * 0.20
     return speed_reward + steering_cost + brake_cost
 
 
@@ -201,8 +209,9 @@ class TelemetryDashboard:
 
     def render(
         self,
-        log_path: Optional[Path] = None,
+        log_path:   Optional[Path] = None,
         log_frames: int = 0,
+        tracker=None,                  # Optional[ProgressTracker]
     ) -> Panel:
         if self._frame is None:
             return Panel(
@@ -233,6 +242,23 @@ class TelemetryDashboard:
             f"             {'LEFT' if f.steering < -0.05 else ('RIGHT' if f.steering > 0.05 else 'STRAIGHT'):^41}",
             "",
             f"  [bold]REWARD[/]     [{reward_color}]{f.reward:+.4f}[/]",
+        ]
+
+        # ── progress block (only shown when a trajectory is loaded) ──────
+        if tracker is not None:
+            pct      = tracker.progress_pct
+            bar_done = int(pct / 100.0 * 28)
+            bar      = "█" * bar_done + "░" * (28 - bar_done)
+            lap_tag  = "  [bold green]LAP COMPLETE[/]" if tracker.lap_complete else ""
+            lines += [
+                "",
+                f"  [bold magenta]PROGRESS[/]   [{bar}]  {pct:5.1f}%{lap_tag}",
+                f"  [dim]waypoint {tracker.furthest_idx:,} / {tracker.total_waypoints:,}"
+                f"   Σreward {tracker.cumulative_reward:,.1f}[/]",
+                f"  [dim]pos  X {f.x:8.1f}  Y {f.y:8.1f}  Z {f.z:8.1f}[/]",
+            ]
+
+        lines += [
             "",
             "  " + "─" * 55,
             f"  [dim]FPS {fps:3d}  │  Frames {self._total:6d}  │  Elapsed {elapsed:6.1f}s[/]",
@@ -275,6 +301,7 @@ class TrackmaniaInterface:
 
     def __init__(self, reward_fn: Callable[[TelemetryFrame], float] = calculate_reward):
         self._env          = None
+        self._iface        = None   # patched tmrl interface (for raw data[])
         self._connected    = False
         self._reward_fn    = reward_fn
         self._last_action  = np.zeros(3, dtype=np.float32)
@@ -291,6 +318,16 @@ class TrackmaniaInterface:
                 )
                 self._env = tmrl.get_environment()
                 self._connected = True
+                # Patch interface to expose raw data[2,3,4] = x,y,z
+                self._iface = getattr(self._env.unwrapped, "interface", None)
+                if self._iface is not None:
+                    _orig = self._iface.grab_data_and_img
+                    def _patched():
+                        data, img = _orig()
+                        self._iface._last_data = data
+                        return data, img
+                    self._iface.grab_data_and_img = _patched
+                    self._iface._last_data = None
                 console.print("[bold green]✓ Connected.[/]")
                 return True
             except ImportError:
@@ -384,6 +421,16 @@ class TrackmaniaInterface:
         gear     = int(flat[1])   if len(flat) > 1 else 0
         rpm      = float(flat[2]) if len(flat) > 2 else 0.0
 
+        # world-space position — read from patched interface (data[2:5])
+        # position is NOT in the obs tuple; tmrl uses it internally for reward only
+        d = getattr(self._iface, "_last_data", None) if self._iface else None
+        try:
+            x = float(d[DATA_IDX_X]) if d is not None else 0.0
+            y = float(d[DATA_IDX_Y]) if d is not None else 0.0
+            z = float(d[DATA_IDX_Z]) if d is not None else 0.0
+        except (IndexError, TypeError):
+            x = y = z = 0.0
+
         action = np.asarray(action, dtype=np.float32).ravel()
         steering = float(np.clip(action[0], -1.0,  1.0)) if len(action) > 0 else 0.0
         throttle = float(np.clip(action[1],  0.0,  1.0)) if len(action) > 1 else 0.0
@@ -397,6 +444,9 @@ class TrackmaniaInterface:
             steering  = steering,
             throttle  = throttle,
             brake     = brake,
+            x         = x,
+            y         = y,
+            z         = z,
         )
         frame.reward = self._reward_fn(frame)
         return frame
@@ -417,18 +467,44 @@ class TrackmaniaInterface:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run(
-    log_format:   str                             = "csv",
-    output_dir:   str                             = "telemetry_logs",
-    reward_fn:    Callable[[TelemetryFrame], float] = calculate_reward,
-    max_episodes: Optional[int]                   = None,
+    log_format:      str                              = "csv",
+    output_dir:      str                              = "telemetry_logs",
+    reward_fn:       Callable[[TelemetryFrame], float] = calculate_reward,
+    max_episodes:    Optional[int]                    = None,
+    trajectory_path: Optional[str]                   = None,
+    wp_spacing:      float                            = 1.0,
 ):
     """
     Connect, log, and display telemetry until Ctrl-C or max_episodes is reached.
 
-    To plug in a trained policy, replace the `action = np.zeros(...)` line with
-    your agent's action selection, e.g.:
-        action = my_agent.act(obs)
+    Args:
+        trajectory_path: Path to a reference waypoints CSV (x,y,z columns).
+                         When provided, reward comes from ProgressTracker instead
+                         of reward_fn.  Generate one with record_trajectory.py.
+        wp_spacing:      Waypoint spacing used if trajectory needs pre-processing.
     """
+    # ── optional progress tracker ────────────────────────────────────────
+    tracker = None
+    if trajectory_path:
+        from progress_tracker import ProgressTracker, TrajectoryProcessor
+        path = Path(trajectory_path)
+        # auto-process raw recording if the file has a 'timestamp' column
+        with open(path, newline="", encoding="utf-8") as fh:
+            header = fh.readline()
+        if "timestamp" in header and "waypoint" not in path.stem:
+            processed_path = path.parent / (path.stem + "_reference.csv")
+            console.print(f"[yellow]Pre-processing raw trajectory → {processed_path}[/]")
+            TrajectoryProcessor.process(str(path), str(processed_path), spacing=wp_spacing)
+            path = processed_path
+        tracker = ProgressTracker(path)
+        console.print(
+            f"[green]ProgressTracker loaded:[/] {tracker.total_waypoints:,} waypoints  "
+            f"({wp_spacing}m spacing)"
+        )
+        # replace reward_fn with the tracker's signal
+        def reward_fn(frame: TelemetryFrame) -> float:  # noqa: F811
+            return tracker.update(frame.x, frame.y, frame.z)
+
     interface = TrackmaniaInterface(reward_fn=reward_fn)
     logger    = TelemetryLogger(output_dir=output_dir, fmt=log_format)
     dashboard = TelemetryDashboard()
@@ -454,11 +530,12 @@ def run(
                     console.print("[red]Could not reset environment.  Exiting.[/]")
                     break
 
-                episode  += 1
-                terminated = truncated = False
+                if tracker is not None:
+                    tracker.reset()
 
-                # ── neutral starting action ──────────────────────────────
-                action = np.zeros(3, dtype=np.float32)
+                episode    += 1
+                terminated  = truncated = False
+                action      = np.zeros(3, dtype=np.float32)
 
                 while not (terminated or truncated):
                     obs, _env_reward, terminated, truncated, _info = interface.step(action)
@@ -468,7 +545,7 @@ def run(
                     frame = interface.parse_observation(obs, action)
                     logger.log(frame)
                     dashboard.update(frame)
-                    live.update(dashboard.render(log_path, logger.frame_count))
+                    live.update(dashboard.render(log_path, logger.frame_count, tracker))
 
                     # ╔══════════════════════════════════════════════════╗
                     # ║  PLUG YOUR POLICY / AGENT HERE                  ║
@@ -510,13 +587,24 @@ def _parse_args() -> argparse.Namespace:
         "--episodes", type=int, default=None,
         help="Stop after N episodes (default: run indefinitely)",
     )
+    p.add_argument(
+        "--trajectory", default=None, metavar="CSV",
+        help="Path to reference trajectory CSV for progress-based reward. "
+             "Generate one with: python record_trajectory.py",
+    )
+    p.add_argument(
+        "--spacing", type=float, default=1.0,
+        help="Waypoint spacing in metres when auto-processing a raw trajectory (default: 1.0)",
+    )
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse_args()
     run(
-        log_format   = args.fmt,
-        output_dir   = args.output_dir,
-        max_episodes = args.episodes,
+        log_format      = args.fmt,
+        output_dir      = args.output_dir,
+        max_episodes    = args.episodes,
+        trajectory_path = args.trajectory,
+        wp_spacing      = args.spacing,
     )

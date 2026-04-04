@@ -21,8 +21,11 @@ ENV/
 *.suo
 *.user
 
-# Telemetry logs
+# Telemetry & trajectory data
 telemetry_logs/
+trajectory_logs/
+*.csv
+*.pkl
 
 # OS
 .DS_Store
