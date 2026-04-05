@@ -1,6 +1,6 @@
 # Trackmania 2020 — Pekiştirmeli Öğrenme ile Otonom Araç Sürüşü
 
-**Bitirme Projesi** | Takım: MRamazanEkim, MRjogurtbey
+**Bitirme Projesi** | Takım: MRamazanEkim, MRjogurtbey, kayracavli
 
 ---
 
@@ -11,6 +11,7 @@ Bu proje, Trackmania 2020 yarış oyununda bir aracın pekiştirmeli öğrenme (
 Geleneksel otonom sürüş çalışmalarının aksine bu projede gerçek bir simülasyon ortamı yerine ticari bir yarış oyunu kullanılmaktadır. Oyunun fizik motoru, araç dinamiği ve pist geometrisi; RL ajanının gerçekçi ve zorlu bir ortamda eğitilmesine olanak tanımaktadır.
 
 **Temel hedefler:**
+
 - Araç telemetrisini gerçek zamanlı olarak okuyup kaydetmek
 - İnsan sürüşünden elde edilen referans verilerle ödül sinyali üretmek
 - Eğitilen RL ajanının aracı başarıyla pistte ilerletmesini sağlamak
@@ -42,23 +43,25 @@ Stable-Baselines3 ile uyumlu `gymnasium.Env` subclass'ı. tmrl'ın tuple observa
 **DrivingController**
 Ajan takılıp kaldığında, durduğunda veya geri gittiğinde episodu erken sonlandırır:
 
-| Koşul | Parametre |
-|---|---|
-| `ZERO_SPEED` | < 5 km/h, 3 saniye boyunca |
-| `STUCK` | 10 saniye boyunca waypoint ilerlemesi yok |
-| `REVERSE` | Hareket vektörü ile ileri yön dot product < −0.3 |
+| Koşul        | Parametre                                        |
+| ------------ | ------------------------------------------------ |
+| `ZERO_SPEED` | < 5 km/h, 3 saniye boyunca                       |
+| `STUCK`      | 10 saniye boyunca waypoint ilerlemesi yok        |
+| `REVERSE`    | Hareket vektörü ile ileri yön dot product < −0.3 |
 
 ---
 
 ## Gözlem ve Aksiyon Uzayı
 
 **Gözlem (Observation):** tmrl `TM20LIDAR` konfigürasyonu
+
 - 19 LIDAR ışını (aracın çevresini ölçer)
 - Araç hızı (m/s)
 - Action buffer (önceki aksiyonlar)
 - Toplam: ~26 boyutlu flat float32 dizisi
 
 **Aksiyon (Action):** `[direksiyon, gaz, fren]`
+
 - Direksiyon: −1.0 (tam sol) … +1.0 (tam sağ)
 - Gaz: 0.0 … 1.0
 - Fren: 0.0 … 1.0
@@ -70,6 +73,7 @@ Ajan takılıp kaldığında, durduğunda veya geri gittiğinde episodu erken so
 Başlangıç algoritması olarak **SAC (Soft Actor-Critic)** seçilmiştir. SAC, sürekli aksiyon uzayları için etkin bir off-policy algoritmasıdır; entropi düzenlileştirmesi sayesinde keşif-sömürü dengesini otomatik olarak yönetir.
 
 Eğitim akışı:
+
 1. İnsan sürüşüyle referans tur kaydedilir (`record_trajectory.py`)
 2. Ham kayıt eşit aralıklı waypoint'lere dönüştürülür
 3. SAC ajanı, ProgressTracker ödülüyle eğitilir
@@ -80,6 +84,7 @@ Eğitim akışı:
 ## Kurulum
 
 ### Gereksinimler
+
 - Python 3.10+
 - Trackmania 2020 (Steam)
 - OpenPlanet: **MLFeed Race Data** ve **MLHook** eklentileri
@@ -126,28 +131,28 @@ python telemetry_monitor.py --trajectory trajectory_logs/raw_..._reference.csv
 
 ## Dosya Yapısı
 
-| Dosya | Açıklama |
-|---|---|
-| `train.py` | SAC eğitim scripti |
-| `ai_driving_logic.py` | `TrackmaniaRLEnvironment` + `DrivingController` |
-| `progress_tracker.py` | Waypoint kaydı ve ilerleme ödülü |
-| `record_trajectory.py` | Manuel tur kayıt aracı |
-| `telemetry_monitor.py` | Gerçek zamanlı telemetri dashboard + loglama |
-| `requirements.txt` | Python bağımlılıkları |
+| Dosya                  | Açıklama                                        |
+| ---------------------- | ----------------------------------------------- |
+| `train.py`             | SAC eğitim scripti                              |
+| `ai_driving_logic.py`  | `TrackmaniaRLEnvironment` + `DrivingController` |
+| `progress_tracker.py`  | Waypoint kaydı ve ilerleme ödülü                |
+| `record_trajectory.py` | Manuel tur kayıt aracı                          |
+| `telemetry_monitor.py` | Gerçek zamanlı telemetri dashboard + loglama    |
+| `requirements.txt`     | Python bağımlılıkları                           |
 
 ---
 
 ## Kullanılan Teknolojiler
 
-| Kütüphane | Kullanım |
-|---|---|
-| [tmrl](https://github.com/trackmania-rl/tmrl) | Trackmania ↔ Python bağlantısı |
-| [Stable-Baselines3](https://github.com/DLR-RM/stable-baselines3) | SAC implementasyonu |
-| [Gymnasium](https://gymnasium.farama.org) | RL ortam standardı |
-| [PyTorch](https://pytorch.org) | Sinir ağı backend |
-| [SciPy](https://scipy.org) | KDTree (waypoint arama) |
-| [Rich](https://github.com/Textualize/rich) | Terminal dashboard |
-| [TensorBoard](https://www.tensorflow.org/tensorboard) | Eğitim metrik görselleştirme |
+| Kütüphane                                                        | Kullanım                       |
+| ---------------------------------------------------------------- | ------------------------------ |
+| [tmrl](https://github.com/trackmania-rl/tmrl)                    | Trackmania ↔ Python bağlantısı |
+| [Stable-Baselines3](https://github.com/DLR-RM/stable-baselines3) | SAC implementasyonu            |
+| [Gymnasium](https://gymnasium.farama.org)                        | RL ortam standardı             |
+| [PyTorch](https://pytorch.org)                                   | Sinir ağı backend              |
+| [SciPy](https://scipy.org)                                       | KDTree (waypoint arama)        |
+| [Rich](https://github.com/Textualize/rich)                       | Terminal dashboard             |
+| [TensorBoard](https://www.tensorflow.org/tensorboard)            | Eğitim metrik görselleştirme   |
 
 ---
 
