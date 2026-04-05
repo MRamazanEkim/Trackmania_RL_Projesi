@@ -34,6 +34,14 @@ Thumbs.db
 # Jupyter
 .ipynb_checkpoints/
 
+# RL training outputs
+checkpoints/
+logs/
+episode_history.json
+
+# Claude Code (kişisel ayarlar)
+.claude/
+
 # Misc
 *.log
 *.tmp
