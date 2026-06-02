@@ -65,7 +65,7 @@ train.py  (eğitim döngüsü, SAC)
 | Bileşen | Girdi | Çıktı |
 |---|---|---|
 | **Gözlem (observation)** | — | 83 sayı: hız + 19 LIDAR ışını + aksiyon geçmişi |
-| **Aksiyon (action)** | SAC ağı | `[direksiyon, gaz, fren]` (sürekli) |
+| **Aksiyon (action)** | SAC ağı | `[direksiyon, gaz, fren]` — **fren iptal**, yalnız gaz + direksiyon kullanılır |
 | **Ödül (reward)** | konum + hız | ProgressTracker'dan (aşağıda) |
 
 ---
@@ -77,13 +77,17 @@ Araç ne yaparsa ne kazanır/kaybeder:
 | Durum | Sonuç | Değer |
 |---|---|---|
 | Referans tur boyunca **ileri** gider (yeni waypoint) | ÖDÜL | **+2** / waypoint |
-| **Hızlı** gider (gaza basmayı öğrensin diye küçük ipucu) | ödül | **+0.002 × hız** |
+| **Hızlı** gider (hız arttıkça ödül artar) | ÖDÜL | **+0.02 × hız** |
 | Parkuru **tamamlar** (%95) | büyük ÖDÜL | **+50** |
 | Her adım (zaman baskısı) | ceza | **−0.05** |
-| **Yerinde durur / sürünür** (<5 km/h) | **büyük ceza** | **−0.5** / adım |
+| **Yerinde durur / sürünür** (<5 km/h) | büyük ceza | **−0.5** / adım |
+| **Yavaş sürer** (<30 km/h, 3 sn'den uzun) | ceza | **−0.3** / adım |
 | Racing line'dan **>5 m sapar** | ceza | sapma arttıkça artan ceza |
-| **>15 m sapar** / duvara çarpar | episode biter + küçük ceza | **−1** |
+| **>15 m sapar** / duvara çarpar | episode biter + ceza | **−2** |
 | Durur (uzun) / takılır / geri gider | episode biter | (başarısızlık) |
+
+> **Fren iptal** + **hız ödülü** birlikte: araç yavaşlayamaz, hızlandıkça daha çok
+> ödül alır → sürekli yüksek hızda gitmeye, dönüşleri direksiyonla almaya itilir.
 
 **Mantık:** İleri ilerleme ödülü (×2) baskındır → araç çizgide kalıp **virajı
 dönmek zorunda**. **Yerinde durma büyük cezası** aracı "sallanma" lokal

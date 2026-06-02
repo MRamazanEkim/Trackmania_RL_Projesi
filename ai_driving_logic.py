@@ -204,11 +204,13 @@ class TrackmaniaRLEnvironment(gymnasium.Env):
     trajectory_path   : Referans waypoint CSV (x,y,z sütunları)
     wp_spacing        : Waypoint aralığı, metre (ham kayıt işlenirken)
     failure_detection : DrivingController'ı etkinleştir/devre dışı bırak
-    speed_reward_coef : Hıza orantılı küçük yoğun ödül katsayısı.
-                        reward += speed_reward_coef * hız(km/h).
-                        Sadece gaza basmayı keşfettiren küçük bir ipucu; düşük
-                        tutulur ki yön-kör "düz gaz" baskın olmasın. İlerleme +
-                        parkurda kalma ödülü baskın kalır.
+    speed_reward_coef : Hıza orantılı ödül katsayısı. reward += coef * hız(km/h).
+                        Araç ne kadar hızlı giderse o kadar çok ödül — yavaş
+                        sallanarak ilerlemeyi caydırır (sadece katedilen mesafe
+                        değil, hız da ödüllendirilir).
+    disable_brake     : True ise fren aksiyonu (idx1) hep kapalı gönderilir;
+                        araç yalnız gaz (idx0) + direksiyon (idx2) kullanır.
+                        Aracın kasıtlı yavaşlayıp ceza/çarpmadan kaçmasını önler.
     crash_penalty     : Episode başarısızlıkla biterse verilen terminal ceza.
                         Küçük tutulur: büyük olursa "sür + çarp" denemesini,
                         "yerinde sallan + hayatta kal" seçeneğinden kötü yapıp
@@ -218,6 +220,12 @@ class TrackmaniaRLEnvironment(gymnasium.Env):
     idle_penalty      : Yerinde durmanın/sürünmenin adım başına büyük cezası.
                         Aracı yerinde sallanma lokal minimumundan çıkarıp hareket
                         etmeye zorlar.
+    low_speed_kmh     : "Yavaş sürüş" eşiği (km/h). Bu değerin altında uzun süre
+                        gidilirse ceza verilir.
+    low_speed_timeout : Hız low_speed_kmh altında bu süreden uzun kalırsa ceza
+                        başlar (saniye). Kısa yavaşlamalara (viraj, kalkış) izin
+                        verir; sürekli yavaş sürünmeyi cezalandırır.
+    low_speed_penalty : low_speed_timeout aşıldıktan sonra adım başına ceza.
     """
 
     metadata = {"render_modes": []}
@@ -227,10 +235,14 @@ class TrackmaniaRLEnvironment(gymnasium.Env):
         trajectory_path: str,
         wp_spacing: float = 1.0,
         failure_detection: bool = True,
-        speed_reward_coef: float = 0.002,
-        crash_penalty: float = 1.0,
+        speed_reward_coef: float = 0.02,
+        crash_penalty: float = 2.0,
         idle_speed_kmh: float = 5.0,
         idle_penalty: float = 0.5,
+        low_speed_kmh: float = 30.0,
+        low_speed_timeout: float = 3.0,
+        low_speed_penalty: float = 0.3,
+        disable_brake: bool = True,
     ):
         super().__init__()
 
@@ -241,6 +253,11 @@ class TrackmaniaRLEnvironment(gymnasium.Env):
         self._crash_penalty = crash_penalty
         self._idle_speed_kmh = idle_speed_kmh
         self._idle_penalty = idle_penalty
+        self._low_speed_kmh = low_speed_kmh
+        self._low_speed_timeout = low_speed_timeout
+        self._low_speed_penalty = low_speed_penalty
+        self._low_speed_start: Optional[float] = None
+        self._disable_brake = disable_brake
 
         # Bileşenler — connect() / reset() içinde somutlaştırılır
         self._interface = None
@@ -353,6 +370,7 @@ class TrackmaniaRLEnvironment(gymnasium.Env):
         if self._controller is not None:
             self._controller.reset()
         self._tracker.reset()
+        self._low_speed_start = None
 
         obs = self._flatten(raw_obs)
         info = {
@@ -365,6 +383,15 @@ class TrackmaniaRLEnvironment(gymnasium.Env):
         self,
         action: np.ndarray,
     ) -> Tuple[np.ndarray, float, bool, bool, dict]:
+        # tmrl klavye mapping: aksiyon = [gaz(idx0), fren(idx1), direksiyon(idx2)].
+        # control[0]>0→ileri, control[1]>0→fren/geri, control[2]>0.5→sağ <-0.5→sol.
+        # Fren iptal: idx1'i -1'e zorla → fren/geri hiç tetiklenmez
+        # (araç yalnız gaz idx0 + direksiyon idx2 kullanır).
+        if self._disable_brake:
+            action = np.asarray(action, dtype=np.float32).copy()
+            if action.shape[-1] > 1:
+                action[1] = -1.0
+
         raw_obs, _tmrl_reward, terminated, truncated, info = (
             self._interface.step(action)
         )
@@ -396,6 +423,16 @@ class TrackmaniaRLEnvironment(gymnasium.Env):
         # Yerinde durma/sürünme büyük cezası — sallanma tuzağına karşı
         if frame.speed_kmh < self._idle_speed_kmh:
             reward -= self._idle_penalty
+        # Sürekli yavaş sürüş cezası — low_speed_kmh altında low_speed_timeout'tan
+        # uzun kalırsa ceza (kısa yavaşlamalara izin var). Aracı hızlı tutmaya iter.
+        _now = time.time()
+        if frame.speed_kmh < self._low_speed_kmh:
+            if self._low_speed_start is None:
+                self._low_speed_start = _now
+            elif (_now - self._low_speed_start) >= self._low_speed_timeout:
+                reward -= self._low_speed_penalty
+        else:
+            self._low_speed_start = None
         progress = self._tracker.progress_pct
 
         # Failure detection — duvara çarpma (STUCK/ZERO_SPEED), geri gitme,
