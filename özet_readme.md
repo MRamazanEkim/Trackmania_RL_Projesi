@@ -76,17 +76,20 @@ Araç ne yaparsa ne kazanır/kaybeder:
 
 | Durum | Sonuç | Değer |
 |---|---|---|
-| Referans tur boyunca **ileri** gider (yeni waypoint) | ÖDÜL | **+1** / waypoint |
+| Referans tur boyunca **ileri** gider (yeni waypoint) | ÖDÜL | **+2** / waypoint |
 | **Hızlı** gider (gaza basmayı öğrensin diye küçük ipucu) | ödül | **+0.002 × hız** |
 | Parkuru **tamamlar** (%95) | büyük ÖDÜL | **+50** |
 | Her adım (zaman baskısı) | ceza | **−0.05** |
+| **Yerinde durur / sürünür** (<5 km/h) | **büyük ceza** | **−0.5** / adım |
 | Racing line'dan **>5 m sapar** | ceza | sapma arttıkça artan ceza |
-| **>15 m sapar** / duvara çarpar | episode biter + terminal ceza | **−5** |
-| Durur / takılır / geri gider | episode biter | (başarısızlık) |
+| **>15 m sapar** / duvara çarpar | episode biter + küçük ceza | **−1** |
+| Durur (uzun) / takılır / geri gider | episode biter | (başarısızlık) |
 
-**Mantık:** İleri + parkurda kalma ödülü baskındır → araç çizgide kalıp **virajı
-dönmek zorunda** (düz gidip duvara çarparsa sapma cezası alır). Küçük zaman cezası
-oyalanmayı engeller; küçük hız ödülü "gaza bas" ipucu verir ama yön-kör değildir.
+**Mantık:** İleri ilerleme ödülü (×2) baskındır → araç çizgide kalıp **virajı
+dönmek zorunda**. **Yerinde durma büyük cezası** aracı "sallanma" lokal
+minimumundan çıkarır (oturup hayatta kalmak artık pahalı). Çarpma cezası **küçük**
+tutulur: büyük olunca "sür+çarp" denemesi, "yerinde sallan" seçeneğinden kötü
+görünüp aracın denemeyi bırakmasına yol açıyordu.
 
 **İlerleme ölçümü (ProgressTracker):** İnsan tarafından kaydedilmiş bir referans tur
 (~2300 eşit aralıklı waypoint) baz alınır. Aracın konumu, bu çizgide ileri-pencere
