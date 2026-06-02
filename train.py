@@ -176,7 +176,7 @@ def train(args: argparse.Namespace):
             # SAC hiperparametreleri — hızlı/sample-efficient öğrenme için ayarlı
             learning_rate=3e-4,
             buffer_size=200_000,
-            learning_starts=3_000,   # İlk N step random aksiyon (keşif) — buffer'ı ileri sürüş örnekleriyle doldur
+            learning_starts=5_000,   # İlk N step random aksiyon (keşif) — buffer'ı ileri sürüş örnekleriyle doldur
             batch_size=256,
             tau=0.005,
             gamma=0.99,

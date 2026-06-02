@@ -209,9 +209,15 @@ class TrackmaniaRLEnvironment(gymnasium.Env):
                         Sadece gaza basmayı keşfettiren küçük bir ipucu; düşük
                         tutulur ki yön-kör "düz gaz" baskın olmasın. İlerleme +
                         parkurda kalma ödülü baskın kalır.
-    crash_penalty     : Episode başarısızlıkla biterse (duvara çarpma → STUCK /
-                        ZERO_SPEED / REVERSE veya parkurdan sapma) verilen terminal
-                        ceza. Aracın duvara çarpmaktansa dönmeyi öğrenmesini sağlar.
+    crash_penalty     : Episode başarısızlıkla biterse verilen terminal ceza.
+                        Küçük tutulur: büyük olursa "sür + çarp" denemesini,
+                        "yerinde sallan + hayatta kal" seçeneğinden kötü yapıp
+                        aracın denemeyi bırakmasına yol açıyordu. Küçük ceza
+                        "duvara çarpma kötü" sinyalini korur, denemeyi öldürmez.
+    idle_speed_kmh    : Hız bu değerin altındaysa araç "duruyor" sayılır (km/h).
+    idle_penalty      : Yerinde durmanın/sürünmenin adım başına büyük cezası.
+                        Aracı yerinde sallanma lokal minimumundan çıkarıp hareket
+                        etmeye zorlar.
     """
 
     metadata = {"render_modes": []}
@@ -222,7 +228,9 @@ class TrackmaniaRLEnvironment(gymnasium.Env):
         wp_spacing: float = 1.0,
         failure_detection: bool = True,
         speed_reward_coef: float = 0.002,
-        crash_penalty: float = 5.0,
+        crash_penalty: float = 1.0,
+        idle_speed_kmh: float = 5.0,
+        idle_penalty: float = 0.5,
     ):
         super().__init__()
 
@@ -231,6 +239,8 @@ class TrackmaniaRLEnvironment(gymnasium.Env):
         self._failure_detection = failure_detection
         self._speed_reward_coef = speed_reward_coef
         self._crash_penalty = crash_penalty
+        self._idle_speed_kmh = idle_speed_kmh
+        self._idle_penalty = idle_penalty
 
         # Bileşenler — connect() / reset() içinde somutlaştırılır
         self._interface = None
@@ -383,6 +393,9 @@ class TrackmaniaRLEnvironment(gymnasium.Env):
         # İlerleme ödülü (+ parkurda kalma) + küçük hız ipucu
         reward = self._tracker.update(frame.x, frame.y, frame.z)
         reward += self._speed_reward_coef * max(0.0, frame.speed_kmh)
+        # Yerinde durma/sürünme büyük cezası — sallanma tuzağına karşı
+        if frame.speed_kmh < self._idle_speed_kmh:
+            reward -= self._idle_penalty
         progress = self._tracker.progress_pct
 
         # Failure detection — duvara çarpma (STUCK/ZERO_SPEED), geri gitme,

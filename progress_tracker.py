@@ -295,6 +295,7 @@ class ProgressTracker:
         off_track_tolerance:  float = 5.0,
         off_track_penalty:    float = 0.5,
         max_stray:            float = 15.0,
+        progress_reward_scale: float = 2.0,
     ):
         self._waypoints: np.ndarray = TrajectoryProcessor.load_raw(trajectory_path)
         self._n         = len(self._waypoints)
@@ -305,6 +306,7 @@ class ProgressTracker:
         self._off_tol   = off_track_tolerance
         self._off_pen   = off_track_penalty
         self._max_stray = max_stray
+        self._prog_scale = progress_reward_scale
 
         # episode state — reset() initialises these
         self._furthest_idx:  int   = 0
@@ -354,10 +356,10 @@ class ProgressTracker:
         self._nearest_idx = lo + local
         self._last_dist   = float(dists[local])
 
-        # Forward-only reward, minus a small constant per-step time penalty
+        # Forward-only reward (scaled), minus a small constant per-step penalty
         new_points          = self._nearest_idx - self._furthest_idx   # ≥ 0
         self._furthest_idx  = self._nearest_idx
-        reward              = float(new_points) - self._step_penalty
+        reward              = self._prog_scale * float(new_points) - self._step_penalty
 
         # Off-track penalty: straying from the reference line costs, growing with
         # distance.  This forces the car to TURN with the track instead of driving
