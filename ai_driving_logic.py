@@ -226,6 +226,10 @@ class TrackmaniaRLEnvironment(gymnasium.Env):
                         başlar (saniye). Kısa yavaşlamalara (viraj, kalkış) izin
                         verir; sürekli yavaş sürünmeyi cezalandırır.
     low_speed_penalty : low_speed_timeout aşıldıktan sonra adım başına ceza.
+    no_progress_timeout: Parkurda ilerleme (yeni waypoint) olmadan geçebilecek
+                        süre (saniye); aşılırsa "yerinde bekleme" cezası başlar.
+    no_progress_penalty: İlerleme olmayan her adımda (grace sonrası) ceza. Hızlı
+                        sallanıp aynı yerde kalan aracı da cezalandırır.
     """
 
     metadata = {"render_modes": []}
@@ -235,13 +239,15 @@ class TrackmaniaRLEnvironment(gymnasium.Env):
         trajectory_path: str,
         wp_spacing: float = 1.0,
         failure_detection: bool = True,
-        speed_reward_coef: float = 0.02,
-        crash_penalty: float = 2.0,
+        speed_reward_coef: float = 0.05,
+        crash_penalty: float = 0.0,
         idle_speed_kmh: float = 5.0,
         idle_penalty: float = 0.5,
         low_speed_kmh: float = 30.0,
         low_speed_timeout: float = 3.0,
         low_speed_penalty: float = 0.3,
+        no_progress_timeout: float = 2.0,
+        no_progress_penalty: float = 0.3,
         disable_brake: bool = True,
     ):
         super().__init__()
@@ -257,6 +263,10 @@ class TrackmaniaRLEnvironment(gymnasium.Env):
         self._low_speed_timeout = low_speed_timeout
         self._low_speed_penalty = low_speed_penalty
         self._low_speed_start: Optional[float] = None
+        self._no_progress_timeout = no_progress_timeout
+        self._no_progress_penalty = no_progress_penalty
+        self._no_progress_start: float = 0.0
+        self._last_progress_idx: int = 0
         self._disable_brake = disable_brake
 
         # Bileşenler — connect() / reset() içinde somutlaştırılır
@@ -371,6 +381,8 @@ class TrackmaniaRLEnvironment(gymnasium.Env):
             self._controller.reset()
         self._tracker.reset()
         self._low_speed_start = None
+        self._no_progress_start = time.time()
+        self._last_progress_idx = 0
 
         obs = self._flatten(raw_obs)
         info = {
@@ -433,6 +445,13 @@ class TrackmaniaRLEnvironment(gymnasium.Env):
                 reward -= self._low_speed_penalty
         else:
             self._low_speed_start = None
+        # Yerinde bekleme cezası — parkurda ilerleme (yeni waypoint) yoksa, kısa
+        # bir grace'ten sonra her adım ceza. Hızlı sallanıp ilerlemeyeni de yakalar.
+        if self._tracker.furthest_idx > self._last_progress_idx:
+            self._last_progress_idx = self._tracker.furthest_idx
+            self._no_progress_start = _now
+        elif (_now - self._no_progress_start) >= self._no_progress_timeout:
+            reward -= self._no_progress_penalty
         progress = self._tracker.progress_pct
 
         # Failure detection — duvara çarpma (STUCK/ZERO_SPEED), geri gitme,
