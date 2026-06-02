@@ -61,24 +61,31 @@ class DrivingController:
     zero_speed_timeout   : Bu süre boyunca duruk kalırsa fail (saniye)
     stuck_timeout        : İlerleme olmadan geçen maks süre (saniye)
     reverse_threshold    : Geri gitme için dot-product eşiği (negatif)
+    grace_period         : Episode başında bu süre boyunca hiçbir başarısızlık
+                           kontrolü yapılmaz. Araca kalkış/hızlanma payı verir;
+                           durağan spawn yüzünden ilk saniyede reset olmasını
+                           engeller (saniye).
     """
 
     def __init__(
         self,
-        zero_speed_threshold: float = 5.0,
+        zero_speed_threshold: float = 2.0,
         zero_speed_timeout: float = 3.0,
         stuck_timeout: float = 10.0,
         reverse_threshold: float = -0.3,
+        grace_period: float = 2.0,
     ):
         self._zero_speed_threshold = zero_speed_threshold
         self._zero_speed_timeout = zero_speed_timeout
         self._stuck_timeout = stuck_timeout
         self._reverse_threshold = reverse_threshold
+        self._grace_period = grace_period
 
         self._zero_speed_start: Optional[float] = None
         self._last_progress_time: float = 0.0
         self._last_progress_value: float = 0.0
         self._last_position: Optional[np.ndarray] = None
+        self._episode_start: float = 0.0
         self._active: bool = False
 
     def reset(self):
@@ -87,6 +94,7 @@ class DrivingController:
         self._last_progress_time = time.time()
         self._last_progress_value = 0.0
         self._last_position = None
+        self._episode_start = time.time()
         self._active = True
 
     def check_failure(
@@ -111,6 +119,11 @@ class DrivingController:
 
         now = time.time()
         position = np.asarray(position, dtype=np.float32)
+
+        # Kalkış payı: episode başında araca hızlanması için süre tanı.
+        if (now - self._episode_start) < self._grace_period:
+            self._last_position = position.copy()
+            return FailureInfo()
 
         # ── Hız Sıfır Kontrolü ────────────────────────────────────────────────
         if speed_kmh < self._zero_speed_threshold:
@@ -191,6 +204,14 @@ class TrackmaniaRLEnvironment(gymnasium.Env):
     trajectory_path   : Referans waypoint CSV (x,y,z sütunları)
     wp_spacing        : Waypoint aralığı, metre (ham kayıt işlenirken)
     failure_detection : DrivingController'ı etkinleştir/devre dışı bırak
+    speed_reward_coef : Hıza orantılı küçük yoğun ödül katsayısı.
+                        reward += speed_reward_coef * hız(km/h).
+                        Sadece gaza basmayı keşfettiren küçük bir ipucu; düşük
+                        tutulur ki yön-kör "düz gaz" baskın olmasın. İlerleme +
+                        parkurda kalma ödülü baskın kalır.
+    crash_penalty     : Episode başarısızlıkla biterse (duvara çarpma → STUCK /
+                        ZERO_SPEED / REVERSE veya parkurdan sapma) verilen terminal
+                        ceza. Aracın duvara çarpmaktansa dönmeyi öğrenmesini sağlar.
     """
 
     metadata = {"render_modes": []}
@@ -200,12 +221,16 @@ class TrackmaniaRLEnvironment(gymnasium.Env):
         trajectory_path: str,
         wp_spacing: float = 1.0,
         failure_detection: bool = True,
+        speed_reward_coef: float = 0.002,
+        crash_penalty: float = 5.0,
     ):
         super().__init__()
 
         self._trajectory_path = str(trajectory_path)
         self._wp_spacing = wp_spacing
         self._failure_detection = failure_detection
+        self._speed_reward_coef = speed_reward_coef
+        self._crash_penalty = crash_penalty
 
         # Bileşenler — connect() / reset() içinde somutlaştırılır
         self._interface = None
@@ -341,11 +366,27 @@ class TrackmaniaRLEnvironment(gymnasium.Env):
         frame = self._interface.parse_observation(raw_obs, action)
         position = np.array([frame.x, frame.y, frame.z], dtype=np.float32)
 
-        # Progress-based reward
+        # Araç henüz spawn olmadıysa pozisyon (0,0,0) gelir. Bu frame'i nötr
+        # geç: aksi halde origin referans çizgiye ~800m uzak görünür, sahte
+        # off-track cezası + anında reset olur.
+        if abs(frame.x) < 1e-3 and abs(frame.y) < 1e-3 and abs(frame.z) < 1e-3:
+            info.update({
+                "progress_pct": self._tracker.progress_pct,
+                "waypoint_idx": self._tracker.furthest_idx,
+                "total_waypoints": self._tracker.total_waypoints,
+                "lap_complete": self._tracker.lap_complete,
+                "failure_reason": "",
+                "dist_from_line": 0.0,
+            })
+            return self._flatten(raw_obs), 0.0, terminated, truncated, info
+
+        # İlerleme ödülü (+ parkurda kalma) + küçük hız ipucu
         reward = self._tracker.update(frame.x, frame.y, frame.z)
+        reward += self._speed_reward_coef * max(0.0, frame.speed_kmh)
         progress = self._tracker.progress_pct
 
-        # Failure detection
+        # Failure detection — duvara çarpma (STUCK/ZERO_SPEED), geri gitme,
+        # veya racing line'dan çok sapma episode'u bitirir.
         failure_reason = ""
         if self._controller is not None:
             failure = self._controller.check_failure(
@@ -356,6 +397,14 @@ class TrackmaniaRLEnvironment(gymnasium.Env):
             if failure.is_failed:
                 terminated = True
                 failure_reason = failure.reason
+        if self._tracker.off_track and not failure_reason:
+            terminated = True
+            failure_reason = "OFF_TRACK"
+
+        # Çarpma/başarısızlık terminal cezası — parkuru tamamlamadan biterse.
+        # Aracın duvara çarpmaktansa dönmeyi tercih etmesini sağlar.
+        if terminated and failure_reason and not self._tracker.lap_complete:
+            reward -= self._crash_penalty
 
         info.update({
             "progress_pct": progress,
@@ -363,6 +412,7 @@ class TrackmaniaRLEnvironment(gymnasium.Env):
             "total_waypoints": self._tracker.total_waypoints,
             "lap_complete": self._tracker.lap_complete,
             "failure_reason": failure_reason,
+            "dist_from_line": self._tracker.last_dist,
         })
 
         obs = self._flatten(raw_obs)

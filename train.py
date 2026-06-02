@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 # Windows cp1254 konsol unicode'u (…, →) encode edemez → stdout'u utf-8'e çevir.
@@ -35,12 +36,56 @@ if sys.platform == "win32":
 import numpy as np
 from stable_baselines3 import SAC
 from stable_baselines3.common.callbacks import (
+    BaseCallback,
     CheckpointCallback,
     EvalCallback,
 )
 from stable_baselines3.common.env_checker import check_env
 
 from ai_driving_logic import TrackmaniaRLEnvironment
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Stop condition: süre dolunca VEYA araç parkuru tamamlayınca eğitimi bitir
+# ══════════════════════════════════════════════════════════════════════════════
+
+class StopOnTimeOrCompletion(BaseCallback):
+    """
+    Eğitimi şu durumlarda erken durdurur:
+      • Araç parkuru tamamlarsa (info['lap_complete'] == True), VEYA
+      • Belirtilen süre (saat) dolduysa.
+
+    Args
+    ----
+    max_hours        : Maksimum eğitim süresi (saat). 0 → süre sınırı yok.
+    stop_on_finish   : Araç bitişe ulaşınca dur.
+    """
+
+    def __init__(self, max_hours: float = 7.0, stop_on_finish: bool = True, verbose: int = 1):
+        super().__init__(verbose)
+        self._max_seconds = max_hours * 3600.0 if max_hours and max_hours > 0 else None
+        self._stop_on_finish = stop_on_finish
+        self._start_time = 0.0
+
+    def _on_training_start(self) -> None:
+        self._start_time = time.time()
+
+    def _on_step(self) -> bool:
+        # Tamamlama kontrolü
+        if self._stop_on_finish:
+            for info in self.locals.get("infos", []):
+                if info.get("lap_complete"):
+                    if self.verbose:
+                        print(f"\n🏁 Araç parkuru tamamladı! ({self.num_timesteps:,} adım) — eğitim durduruluyor.")
+                    return False
+        # Süre kontrolü
+        if self._max_seconds is not None:
+            elapsed = time.time() - self._start_time
+            if elapsed >= self._max_seconds:
+                if self.verbose:
+                    print(f"\n⏰ Süre doldu ({elapsed/3600:.2f} saat, {self.num_timesteps:,} adım) — eğitim durduruluyor.")
+                return False
+        return True
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -103,6 +148,16 @@ def train(args: argparse.Namespace):
 
     callbacks = [checkpoint_cb]
 
+    # Süre/tamamlama ile erken durdurma
+    if args.max_hours > 0 or args.stop_on_finish:
+        callbacks.append(
+            StopOnTimeOrCompletion(
+                max_hours=args.max_hours,
+                stop_on_finish=args.stop_on_finish,
+                verbose=1,
+            )
+        )
+
     # ── Model ─────────────────────────────────────────────────────────────────
     if args.resume:
         resume_path = Path(args.resume)
@@ -121,7 +176,7 @@ def train(args: argparse.Namespace):
             # SAC hiperparametreleri — hızlı/sample-efficient öğrenme için ayarlı
             learning_rate=3e-4,
             buffer_size=200_000,
-            learning_starts=1_000,   # İlk N step random aksiyon (keşif)
+            learning_starts=3_000,   # İlk N step random aksiyon (keşif) — buffer'ı ileri sürüş örnekleriyle doldur
             batch_size=256,
             tau=0.005,
             gamma=0.99,
@@ -168,8 +223,20 @@ def _parse_args() -> argparse.Namespace:
         help="Referans waypoint CSV dosyası (record_trajectory.py ile oluşturulur)",
     )
     p.add_argument(
-        "--timesteps", type=int, default=100_000,
-        help="Toplam eğitim adımı",
+        "--timesteps", type=int, default=2_000_000,
+        help="Maks toplam eğitim adımı (genelde süre/tamamlama önce durdurur)",
+    )
+    p.add_argument(
+        "--max-hours", type=float, default=7.0,
+        help="Maksimum eğitim süresi (saat). 0 → süre sınırı yok",
+    )
+    p.add_argument(
+        "--stop-on-finish", action="store_true", default=True,
+        help="Araç parkuru tamamlayınca eğitimi durdur",
+    )
+    p.add_argument(
+        "--no-stop-on-finish", dest="stop_on_finish", action="store_false",
+        help="Araç tamamlasa bile eğitime devam et",
     )
     p.add_argument(
         "--resume", default=None, metavar="ZIP",

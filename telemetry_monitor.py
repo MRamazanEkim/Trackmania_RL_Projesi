@@ -335,16 +335,29 @@ class TrackmaniaInterface:
                 )
                 self._env = tmrl.get_environment()
                 self._connected = True
-                # Patch interface to expose raw data[2,3,4] = x,y,z
+                # Patch interface to expose raw data[2,3,4] = x,y,z.
+                # TM20LIDAR uses grab_lidar_speed_and_data(); the image interface
+                # uses grab_data_and_img().  Patch whichever exists so _last_data
+                # is populated every step (position is NOT in the obs tuple).
                 self._iface = getattr(self._env.unwrapped, "interface", None)
                 if self._iface is not None:
-                    _orig = self._iface.grab_data_and_img
-                    def _patched():
-                        data, img = _orig()
-                        self._iface._last_data = data
-                        return data, img
-                    self._iface.grab_data_and_img = _patched
                     self._iface._last_data = None
+
+                    if hasattr(self._iface, "grab_lidar_speed_and_data"):
+                        _orig_lidar = self._iface.grab_lidar_speed_and_data
+                        def _patched_lidar():
+                            lidar, speed, data = _orig_lidar()
+                            self._iface._last_data = data
+                            return lidar, speed, data
+                        self._iface.grab_lidar_speed_and_data = _patched_lidar
+
+                    if hasattr(self._iface, "grab_data_and_img"):
+                        _orig_img = self._iface.grab_data_and_img
+                        def _patched_img():
+                            data, img = _orig_img()
+                            self._iface._last_data = data
+                            return data, img
+                        self._iface.grab_data_and_img = _patched_img
                 console.print("[bold green]✓ Connected.[/]")
                 return True
             except ImportError:

@@ -274,6 +274,15 @@ class ProgressTracker:
                           actively penalised.  Set 0.0 to disable.
     search_window         How many waypoints ahead to scan for the nearest match
                           (allows/rewards cuts up to this many waypoints).
+    off_track_tolerance   Distance (m) from the reference line that is "free".
+                          Beyond it, a penalty grows linearly.  Forces the car to
+                          follow the racing line → it MUST turn at corners instead
+                          of driving straight off the track.
+    off_track_penalty     Penalty per metre strayed beyond off_track_tolerance.
+    max_stray             If the car is further than this (m) from the line, it is
+                          considered off-track; `off_track` becomes True so the env
+                          can terminate the episode (prevents speed-farming off
+                          the road).
     """
 
     def __init__(
@@ -283,6 +292,9 @@ class ProgressTracker:
         completion_threshold: float = 0.95,
         step_penalty:         float = 0.05,
         search_window:        int   = 300,
+        off_track_tolerance:  float = 5.0,
+        off_track_penalty:    float = 0.5,
+        max_stray:            float = 15.0,
     ):
         self._waypoints: np.ndarray = TrajectoryProcessor.load_raw(trajectory_path)
         self._n         = len(self._waypoints)
@@ -290,6 +302,9 @@ class ProgressTracker:
         self._thresh    = completion_threshold
         self._step_penalty = step_penalty
         self._window    = max(1, int(search_window))
+        self._off_tol   = off_track_tolerance
+        self._off_pen   = off_track_penalty
+        self._max_stray = max_stray
 
         # episode state — reset() initialises these
         self._furthest_idx:  int   = 0
@@ -297,6 +312,8 @@ class ProgressTracker:
         self._cumulative:    float = 0.0
         self._steps:         int   = 0
         self._nearest_idx:   int   = 0   # last raw nearest (for display)
+        self._last_dist:     float = 0.0 # distance to reference line this step
+        self._off_track:     bool  = False
 
     # ── lifecycle ─────────────────────────────────────────────────────────
 
@@ -307,6 +324,8 @@ class ProgressTracker:
         self._cumulative   = 0.0
         self._steps        = 0
         self._nearest_idx  = 0
+        self._last_dist    = 0.0
+        self._off_track    = False
 
     # ── per-step computation ──────────────────────────────────────────────
 
@@ -330,13 +349,22 @@ class ProgressTracker:
         lo  = self._furthest_idx
         hi  = min(self._n, lo + self._window + 1)
         seg = self._waypoints[lo:hi]
-        local = int(np.argmin(np.linalg.norm(seg - pos, axis=1)))
+        dists = np.linalg.norm(seg - pos, axis=1)
+        local = int(np.argmin(dists))
         self._nearest_idx = lo + local
+        self._last_dist   = float(dists[local])
 
         # Forward-only reward, minus a small constant per-step time penalty
         new_points          = self._nearest_idx - self._furthest_idx   # ≥ 0
         self._furthest_idx  = self._nearest_idx
         reward              = float(new_points) - self._step_penalty
+
+        # Off-track penalty: straying from the reference line costs, growing with
+        # distance.  This forces the car to TURN with the track instead of driving
+        # straight off corners.  Beyond max_stray the episode is flagged off-track.
+        if self._last_dist > self._off_tol:
+            reward -= self._off_pen * (self._last_dist - self._off_tol)
+        self._off_track = self._last_dist > self._max_stray
 
         # Lap completion bonus (fires at most once per episode)
         if not self._lap_complete:
@@ -363,6 +391,16 @@ class ProgressTracker:
     def nearest_idx(self) -> int:
         """Waypoint index nearest to the car's *current* position."""
         return self._nearest_idx
+
+    @property
+    def last_dist(self) -> float:
+        """Distance (m) from the reference line at the last update."""
+        return self._last_dist
+
+    @property
+    def off_track(self) -> bool:
+        """True if the car strayed further than max_stray from the line."""
+        return self._off_track
 
     @property
     def total_waypoints(self) -> int:
