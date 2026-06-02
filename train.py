@@ -24,6 +24,14 @@ import argparse
 import sys
 from pathlib import Path
 
+# Windows cp1254 konsol unicode'u (…, →) encode edemez → stdout'u utf-8'e çevir.
+if sys.platform == "win32":
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError):
+            pass
+
 import numpy as np
 from stable_baselines3 import SAC
 from stable_baselines3.common.callbacks import (

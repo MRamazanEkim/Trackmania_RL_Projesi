@@ -29,7 +29,6 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from scipy.spatial import KDTree
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -243,17 +242,25 @@ class ProgressTracker:
     Algorithm
     ---------
     At every physics tick:
-      1. Query KDTree for the waypoint nearest to the car's XYZ.
-      2. reward = max(0,  nearest_idx − furthest_idx_this_lap)
+      1. Find the nearest waypoint searching ONLY a forward window
+         [furthest_idx, furthest_idx + search_window]  (tmrl-style).
+      2. reward = nearest_idx − furthest_idx   (≥ 0 by construction)
          → positive only when the car passes new waypoints forward.
-      3. furthest_idx = max(furthest_idx, nearest_idx)  ← monotonically increasing
+      3. furthest_idx = nearest_idx  ← monotonically increasing
       4. If furthest_idx crosses the completion threshold, award lap_bonus once.
+
+    Why a forward window, not a global KDTree nearest
+    -------------------------------------------------
+    On loop tracks the start and finish coincide in space (≈0 m apart).  A
+    global nearest-neighbour query at spawn can snap to the LAST waypoint
+    (~index N) instead of index 0, awarding a huge spurious reward and
+    destroying the learning signal.  Searching only forward from furthest_idx
+    is robust to loops and gives natural anti-backwards behaviour.
 
     Anti-backwards guarantee
     ------------------------
-    furthest_idx never decreases within an episode.  Driving backward reduces
-    nearest_idx but furthest_idx stays put → reward = max(0, ...) = 0.
-    Re-passing already-cleared waypoints also yields 0.
+    furthest_idx never decreases within an episode.  Driving backward keeps the
+    nearest forward-window match at furthest_idx → reward = 0 (minus step_penalty).
 
     Args
     ----
@@ -265,6 +272,8 @@ class ProgressTracker:
                           idea).  Forward progress (~+1/waypoint) dominates it, so
                           driving stays net-positive while standing still is
                           actively penalised.  Set 0.0 to disable.
+    search_window         How many waypoints ahead to scan for the nearest match
+                          (allows/rewards cuts up to this many waypoints).
     """
 
     def __init__(
@@ -273,13 +282,14 @@ class ProgressTracker:
         lap_bonus:            float = 50.0,
         completion_threshold: float = 0.95,
         step_penalty:         float = 0.05,
+        search_window:        int   = 300,
     ):
         self._waypoints: np.ndarray = TrajectoryProcessor.load_raw(trajectory_path)
-        self._tree      = KDTree(self._waypoints)
         self._n         = len(self._waypoints)
         self._lap_bonus = lap_bonus
         self._thresh    = completion_threshold
         self._step_penalty = step_penalty
+        self._window    = max(1, int(search_window))
 
         # episode state — reset() initialises these
         self._furthest_idx:  int   = 0
@@ -315,13 +325,17 @@ class ProgressTracker:
         """
         self._steps += 1
 
-        # Nearest waypoint (KDTree query: O(log N) per call)
-        _dist, raw_idx = self._tree.query([[x, y, z]], k=1)
-        self._nearest_idx = int(raw_idx[0])
+        # Nearest waypoint within a FORWARD window from furthest_idx (loop-safe).
+        pos = np.array([x, y, z], dtype=np.float32)
+        lo  = self._furthest_idx
+        hi  = min(self._n, lo + self._window + 1)
+        seg = self._waypoints[lo:hi]
+        local = int(np.argmin(np.linalg.norm(seg - pos, axis=1)))
+        self._nearest_idx = lo + local
 
         # Forward-only reward, minus a small constant per-step time penalty
-        new_points          = max(0, self._nearest_idx - self._furthest_idx)
-        self._furthest_idx  = max(self._furthest_idx, self._nearest_idx)
+        new_points          = self._nearest_idx - self._furthest_idx   # ≥ 0
+        self._furthest_idx  = self._nearest_idx
         reward              = float(new_points) - self._step_penalty
 
         # Lap completion bonus (fires at most once per episode)

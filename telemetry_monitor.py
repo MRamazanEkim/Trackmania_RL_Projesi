@@ -38,6 +38,15 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+# Windows konsolu Türkçe codepage (cp1254) → ✓ … → gibi unicode'u encode edemez.
+# stdout/stderr'i utf-8'e çevir, aksi halde rich print UnicodeEncodeError ile çöker.
+if sys.platform == "win32":
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError):
+            pass
+
 console = Console()
 
 # Import AI driving logic components
