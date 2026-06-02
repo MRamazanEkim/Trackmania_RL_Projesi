@@ -260,6 +260,11 @@ class ProgressTracker:
     trajectory_path       Path to a discretized waypoints CSV (x,y,z columns).
     lap_bonus             One-time reward added at lap completion.
     completion_threshold  Fraction of waypoints (0–1) required for lap bonus.
+    step_penalty          Small reward subtracted every step.  Pushes the agent
+                          to keep moving and finish faster (tmrl CONSTANT_PENALTY
+                          idea).  Forward progress (~+1/waypoint) dominates it, so
+                          driving stays net-positive while standing still is
+                          actively penalised.  Set 0.0 to disable.
     """
 
     def __init__(
@@ -267,12 +272,14 @@ class ProgressTracker:
         trajectory_path:      str | Path,
         lap_bonus:            float = 50.0,
         completion_threshold: float = 0.95,
+        step_penalty:         float = 0.05,
     ):
         self._waypoints: np.ndarray = TrajectoryProcessor.load_raw(trajectory_path)
         self._tree      = KDTree(self._waypoints)
         self._n         = len(self._waypoints)
         self._lap_bonus = lap_bonus
         self._thresh    = completion_threshold
+        self._step_penalty = step_penalty
 
         # episode state — reset() initialises these
         self._furthest_idx:  int   = 0
@@ -312,10 +319,10 @@ class ProgressTracker:
         _dist, raw_idx = self._tree.query([[x, y, z]], k=1)
         self._nearest_idx = int(raw_idx[0])
 
-        # Forward-only reward
+        # Forward-only reward, minus a small constant per-step time penalty
         new_points          = max(0, self._nearest_idx - self._furthest_idx)
         self._furthest_idx  = max(self._furthest_idx, self._nearest_idx)
-        reward              = float(new_points)
+        reward              = float(new_points) - self._step_penalty
 
         # Lap completion bonus (fires at most once per episode)
         if not self._lap_complete:

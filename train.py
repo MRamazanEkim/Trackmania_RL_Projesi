@@ -110,15 +110,16 @@ def train(args: argparse.Namespace):
             env=env,
             verbose=1,
             tensorboard_log=args.log_dir,
-            # SAC hiperparametreleri — sonraki aşamada özelleştirilebilir
+            # SAC hiperparametreleri — hızlı/sample-efficient öğrenme için ayarlı
             learning_rate=3e-4,
-            buffer_size=100_000,
+            buffer_size=200_000,
             learning_starts=1_000,   # İlk N step random aksiyon (keşif)
             batch_size=256,
             tau=0.005,
             gamma=0.99,
             train_freq=1,
-            gradient_steps=1,
+            gradient_steps=2,        # her gerçek adımda 2 güncelleme → az dakikada çok öğren
+            ent_coef="auto",         # entropy katsayısı otomatik → otomatik keşif dengesi
         )
         reset_timesteps = True
 
