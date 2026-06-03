@@ -242,7 +242,7 @@ class TrackmaniaRLEnvironment(gymnasium.Env):
         speed_reward_coef: float = 0.05,
         crash_penalty: float = 0.3,
         idle_speed_kmh: float = 5.0,
-        idle_penalty: float = 0.5,
+        idle_penalty: float = 1.0,
         low_speed_kmh: float = 30.0,
         low_speed_timeout: float = 3.0,
         low_speed_penalty: float = 0.3,

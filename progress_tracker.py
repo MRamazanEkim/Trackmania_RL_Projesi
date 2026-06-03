@@ -295,7 +295,7 @@ class ProgressTracker:
         off_track_tolerance:  float = 5.0,
         off_track_penalty:    float = 0.5,
         max_stray:            float = 15.0,
-        progress_reward_scale: float = 2.0,
+        progress_reward_scale: float = 4.0,
     ):
         self._waypoints: np.ndarray = TrajectoryProcessor.load_raw(trajectory_path)
         self._n         = len(self._waypoints)
