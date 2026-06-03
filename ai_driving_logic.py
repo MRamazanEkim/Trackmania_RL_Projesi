@@ -240,7 +240,7 @@ class TrackmaniaRLEnvironment(gymnasium.Env):
         wp_spacing: float = 1.0,
         failure_detection: bool = True,
         speed_reward_coef: float = 0.05,
-        crash_penalty: float = 1.0,
+        crash_penalty: float = 0.3,
         idle_speed_kmh: float = 5.0,
         idle_penalty: float = 0.5,
         low_speed_kmh: float = 30.0,
