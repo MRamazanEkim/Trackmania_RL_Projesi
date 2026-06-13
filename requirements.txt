@@ -16,3 +16,4 @@ opencv-python>=4.8.0
 tensorboard>=2.14.0
 matplotlib>=3.7.0
 pandas>=2.0.0
+pygame>=2.5.0
