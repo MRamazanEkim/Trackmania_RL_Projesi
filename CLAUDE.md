@@ -1,123 +1,236 @@
-# Trackmania RL — Proje Rehberi
+# Trackmania RL — Proje Rehberi (AI için)
 
-Trackmania 2020'de otonom araç sürüşü için RL ajanı geliştirme projesi.
-Bitirme projesi. Amaç: kayıtlı verilerle RL algoritması geliştirmek ve aracı otonom sürmek.
+Trackmania 2020'de SAC algoritmasıyla otonom araç sürüşü geliştiren bitirme projesi.
+Bu dosya hem insan hem de AI asistanlar için yazılmıştır — branch'i ilk açan AI buradan başlamalı.
+
+---
+
+## Aktif Branch: `feature/experience-database`
+
+Bu branch `main`'e ek olarak şunları getirir:
+
+| Eklenen | Ne işe yarar |
+|---|---|
+| `db/experience_store.py` | SQLite tabanlı deneyim deposu (training_runs + episodes tabloları) |
+| `db/callbacks.py` | SB3 callback'leri: episode loglama + replay buffer checkpoint |
+| `ui_dashboard.py` | Pygame penceresi: canlı LIDAR radar + telemetri görselleştirmesi |
+| `train.py` güncellendi | DB entegrasyonu, replay buffer kaydet/yükle, `--db-path` argümanı |
+
+**Temel kazanım:** `--resume` ile devam edilince önceki oturumun replay buffer'ı otomatik yüklenir
+→ ajan her seferinde sıfırdan başlamaz.
+
+---
 
 ## Mimari
 
 ```
 train.py
-  └─► TrackmaniaRLEnvironment  (ai_driving_logic.py)   ← gymnasium.Env
-        ├─► TrackmaniaInterface  (telemetry_monitor.py) ← tmrl wrapper
-        ├─► ProgressTracker      (progress_tracker.py)  ← waypoint reward
-        └─► DrivingController    (ai_driving_logic.py)  ← failure detection
+  ├── ExperienceStore (db/experience_store.py)   ← SQLite: run + episode kayıtları
+  ├── EpisodeLoggerCallback (db/callbacks.py)    ← her episode sonu DB'ye yaz
+  ├── ReplayBufferCheckpointCallback             ← checkpoint ile .pkl kaydet
+  └── TrackmaniaRLEnvironment (ai_driving_logic.py)   ← gymnasium.Env
+        ├── TrackmaniaInterface (telemetry_monitor.py) ← tmrl oyun bağlantısı
+        ├── ProgressTracker (progress_tracker.py)      ← KDTree waypoint ödülü
+        └── DrivingController (ai_driving_logic.py)    ← ZERO_SPEED/STUCK/REVERSE
+
+ui_dashboard.py  ← bağımsız pygame penceresi (eğitimden ayrı çalışır)
 ```
 
-**Observation:** tmrl LIDAR (~26 float, flat Box) — hız + 19 LIDAR ışını + action buffer  
-**Action:** `[steering, gas, brake]` — her biri float, tmrl üzerinden doğrudan oyun motoruna gönderilir  
-**Reward:** Araç yeni waypoint geçtikçe +1, tamamlama bonusu +50  
-**Episode sonu:** tmrl terminated/truncated VEYA DrivingController: ZERO_SPEED / STUCK / REVERSE
+**Observation:** tmrl TM20LIDAR — tuple formatı:
+- `obs[0]` → hız (1 float, m/s)
+- `obs[1]` → 19 LIDAR ışını (piksel mesafesi, 64×64 görüntü, maks ~60px)
+- `obs[2:]` → action buffer (act_buf_len=2, her biri 3 float)
+- Flat hale getirince: `[speed, lidar×19, action_buf×6]` = 26 float
 
-## Kurulum
+**Action:** `[steering, gas, brake]` — float, tmrl socket üzerinden oyun motoruna
 
-### Gereksinimler
+**Reward:** `ProgressTracker.update()` → yeni waypoint +1, adım başı −0.05, tur bonusu +50
+
+**Episode sonu:** tmrl terminated/truncated **veya** DrivingController tetiklenir:
+- `ZERO_SPEED`: < 5 km/h, 3 saniye
+- `STUCK`: 10 saniyede waypoint ilerlemesi yok
+- `REVERSE`: hareket vektörü ile ileri yön dot < −0.3
+
+---
+
+## Kurulum (sıfırdan)
+
+### 1. Sistem gereksinimleri
+
 - Python 3.10+
-- Trackmania 2020 (Steam)
-- OpenPlanet: **MLFeed Race Data** + **MLHook** plugin'leri kurulu ve aktif
-- tmrl OpenPlanet plugin'i kurulu (tmrl dokümantasyonuna bak)
+- Trackmania 2020 (Steam, lisanslı)
+- **OpenPlanet** (oyun içi mod çalıştırıcı) — F3 ile açılır
+  - Plugin: **MLFeed Race Data** (aktif olmalı)
+  - Plugin: **MLHook** (aktif olmalı)
+  - Plugin: **TMRL_GrabData** / tmrl OpenPlanet plugin'i (aktif olmalı)
 
-### Adımlar
+### 2. Python ortamı
 
-```bat
+```powershell
+cd Trackmania_RL_Projesi
 python -m venv venv
-venv\Scripts\activate
-pip install -r requirements.txt --no-cache-dir
+.\venv\Scripts\activate
+pip install -r requirements.txt --no-cache-dir --trusted-host pypi.org --trusted-host files.pythonhosted.org
 ```
 
-### tmrl Konfigürasyonu
+> SSL hatası alırsan `--trusted-host` eklerini kullan (kurumsal ağ / antivirus)
 
-`C:\Users\<kullanıcı>\TmrlData\config\config.json` dosyasında şu ayar olmalı:
+### 3. tmrl konfigürasyonu
+
+`C:\Users\<kullanici>\TmrlData\config\config.json` içinde:
 
 ```json
 "RTGYM_INTERFACE": "TM20LIDAR"
 ```
 
-Image tabanlı (`TM20IMAGES`) ise observation space 16000+ boyuta çıkar, MlpPolicy çalışmaz.
-Referans LIDAR config: `C:\Users\<kullanıcı>\TmrlData\resources\config_lidars.json`
+`TM20IMAGES` bırakırsan observation space 16000+ boyuta çıkar → `MlpPolicy` çalışmaz.
 
-## Kullanım
+---
 
-### 1. Referans Tur Kaydet
+## Kullanım — Adım Adım
 
-Trackmania açıkken, haritada araçla bir tur sürerek kayıt al:
+### Adım 1 — Referans tur kaydet
 
-```bat
+Trackmania **açık**, haritada araç **pistte** iken:
+
+```powershell
+.\venv\Scripts\activate
 python record_trajectory.py --process
 ```
 
-`trajectory_logs/` klasörüne `raw_..._reference.csv` dosyası oluşur.
+- 5 saniyelik geri sayım: Trackmania penceresine tıkla
+- Bir tam tur sür, `Ctrl+C` ile bitir
+- `trajectory_logs/raw_YYYYMMDD_HHMMSS_reference.csv` oluşur
 
-### 2. Eğitimi Başlat
+### Adım 2 — Eğitimi başlat
 
-```bat
-python train.py --trajectory trajectory_logs/raw_..._reference.csv
+```powershell
+python train.py --trajectory trajectory_logs/raw_YYYYMMDD_HHMMSS_reference.csv
 ```
 
-Her 5000 adımda `checkpoints/` klasörüne kayıt yapılır.
+- `training.db` oluşur (SQLite, episode istatistikleri)
+- Her 5000 adımda `checkpoints/sac_tm_NNNNN_steps.zip` + `..._replay.pkl`
+- TensorBoard: `tensorboard --logdir logs/tb` → `http://localhost:6006`
 
-### 3. Checkpoint'ten Devam Et
+### Adım 3 — Kaldığı yerden devam et
 
-```bat
-python train.py --trajectory trajectory_logs/raw_..._reference.csv --resume checkpoints/sac_tm_5000_steps.zip
+```powershell
+python train.py \
+  --trajectory trajectory_logs/raw_YYYYMMDD_HHMMSS_reference.csv \
+  --resume checkpoints/sac_tm_5000_steps.zip
 ```
 
-### 4. TensorBoard ile İzle
+→ `sac_tm_5000_steps_replay.pkl` otomatik bulunup yüklenir.
+→ Terminal: `Replay buffer yuklendi: XXXX transition`
 
-```bat
-tensorboard --logdir logs/tb
+### Adım 4 — Canlı dashboard (eğitimden bağımsız)
+
+```powershell
+python ui_dashboard.py
+# veya trajectory ile:
+python ui_dashboard.py --trajectory trajectory_logs/raw_YYYYMMDD_HHMMSS_reference.csv
 ```
 
-Tarayıcıda: `http://localhost:6006`
+- Sol panel: LIDAR radar (19 ışın, renk kodlu)
+- Sağ panel: hız, vites/RPM, gaz/fren, direksiyon, konum, ilerleme
+- ESC veya pencereyi kapat → çıkar
 
-### 5. Sadece Telemetri İzle (eğitim olmadan)
-
-```bat
-python telemetry_monitor.py --trajectory trajectory_logs/raw_..._reference.csv
-```
+---
 
 ## Dosya Yapısı
 
-| Dosya | Açıklama |
-|---|---|
-| `train.py` | SB3 SAC eğitim scripti — buradan başla |
-| `ai_driving_logic.py` | `TrackmaniaRLEnvironment` (gymnasium.Env) + `DrivingController` |
-| `progress_tracker.py` | KDTree tabanlı waypoint ilerleme ödülü — değiştirme |
-| `record_trajectory.py` | Manuel tur kaydı aracı |
-| `telemetry_monitor.py` | Gerçek zamanlı telemetri dashboard + loglama |
-| `requirements.txt` | Python bağımlılıkları |
+```
+Trackmania_RL_Projesi/
+├── train.py                  ← SAC eğitim scripti — buradan başla
+├── ai_driving_logic.py       ← TrackmaniaRLEnvironment + DrivingController
+├── progress_tracker.py       ← KDTree waypoint ödülü — değiştirme
+├── record_trajectory.py      ← Manuel tur kayıt aracı
+├── telemetry_monitor.py      ← Terminal tabanlı telemetri dashboard
+├── ui_dashboard.py           ← Pygame LIDAR + telemetri penceresi (YENİ)
+├── requirements.txt          ← Python bağımlılıkları
+├── db/
+│   ├── experience_store.py   ← ExperienceStore (SQLite wrapper) (YENİ)
+│   └── callbacks.py          ← EpisodeLoggerCallback + ReplayBufferCheckpointCallback (YENİ)
+├── checkpoints/              ← model .zip + replay .pkl dosyaları (git ignore)
+├── trajectory_logs/          ← ham ve referans CSV'ler (git ignore)
+├── logs/tb/                  ← TensorBoard logları (git ignore)
+└── training.db               ← SQLite veritabanı (git ignore)
+```
+
+---
+
+## Veritabanı Şeması
+
+```sql
+-- Her python train.py çağrısı = bir satır
+training_runs (id, started_at, trajectory_path, resume_path, checkpoint_dir, total_timesteps)
+
+-- Her episode sonu = bir satır
+episodes (id, run_id, episode_number, global_step,
+          cumulative_reward, steps, furthest_waypoint,
+          progress_pct, lap_complete, failure_reason, ended_at)
+```
+
+DB'yi sorgulamak için:
+
+```python
+from db.experience_store import ExperienceStore
+s = ExperienceStore("training.db")
+print(s.recent_episodes(run_id=1, n=10))  # son 10 episode
+print(s.best_progress())                   # tüm zamanların rekoru
+s.close()
+```
+
+---
+
+## SAC Hiperparametreleri (train.py)
+
+| Parametre | Değer | Not |
+|---|---|---|
+| `learning_rate` | 3e-4 | |
+| `buffer_size` | 200 000 | ~46 MB .pkl |
+| `learning_starts` | 5 000 | ilk N adım rastgele |
+| `batch_size` | 256 | |
+| `gamma` | 0.99 | |
+| `gradient_steps` | 2 | adım başı 2 güncelleme |
+| `ent_coef` | "auto" | otomatik entropi dengesi |
+| `save_freq` | 5 000 | checkpoint aralığı |
+
+---
 
 ## Kendi Ajanını Geliştirme
 
-Şu an SB3 SAC kullanılıyor. Kendi RL ajanını entegre etmek için:
-
-1. `TrackmaniaRLEnvironment` değişmez — gymnasium.Env arayüzü sabit kalır
-2. `train.py`'da `SAC` yerine kendi modelini kullan:
+`TrackmaniaRLEnvironment` gymnasium arayüzü sabittir — değiştirme.
+`train.py` içinde sadece model bloğunu değiştir:
 
 ```python
-# train.py içinde, model oluşturma kısmını değiştir:
+# SAC yerine kendi modelini koy:
 from my_agent import MyAgent
 model = MyAgent(env)
-model.learn(total_timesteps=args.timesteps)
+model.learn(total_timesteps=args.timesteps, callback=callbacks)
 ```
 
-Ortam `reset()` → `(obs, info)`, `step(action)` → `(obs, reward, terminated, truncated, info)` döndürür.
+---
+
+## LIDAR Teknik Detaylar
+
+- **19 ışın**, image koordinatlarında `range(90, 280, 10)` derece
+- Kaynak: `venv/lib/site-packages/tmrl/custom/tm/utils/tools.py`
+- Değerler **piksel cinsinden mesafe** (64×64 görüntüde maks ~60px)
+- UI'da normalize: `lidar_px / 60.0` → renk: kırmızı (yakın) → yeşil (uzak)
+- LIDAR ışınları ters görünürse `ui_dashboard.py` içinde `LIDAR_FLIP = True`
+
+---
 
 ## Sık Karşılaşılan Sorunlar
 
 | Hata | Çözüm |
 |---|---|
-| `ModuleNotFoundError: stable_baselines3` | `venv\Scripts\activate` çalıştırılmadı |
+| `ModuleNotFoundError: stable_baselines3` | `.\venv\Scripts\activate` çalıştırılmadı |
 | `Connection refused` | Trackmania açık değil veya OpenPlanet plugin'leri aktif değil |
-| Observation space `(16393,)` | `config.json`'da `RTGYM_INTERFACE` → `TM20LIDAR` yap |
-| `Time-step timed out` | Normal, ilk bağlantıda görünebilir; eğitim başlarsa sorun yok |
-| `pip install` permission error | `pip install -r requirements.txt --no-cache-dir` kullan |
+| `OpenPlanet stopped sending data` | Trackmania'da aktif bir harita yüklü değil (menüde değil, pistte ol) |
+| `Observation space (16393,)` | `config.json`'da `RTGYM_INTERFACE` → `TM20LIDAR` yap |
+| `FileNotFoundError: raw_..._reference.csv` | Önce `record_trajectory.py --process` çalıştır |
+| `pip install` SSL hatası | `--trusted-host pypi.org --trusted-host files.pythonhosted.org` ekle |
+| `Replay buffer bulunamadi` uyarısı | Normal: ilk `--resume`'de .pkl yoksa sıfırdan başlar |
+| LIDAR ışınları ters | `ui_dashboard.py` içinde `LIDAR_FLIP = True` yap |
