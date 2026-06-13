@@ -43,6 +43,8 @@ from stable_baselines3.common.callbacks import (
 from stable_baselines3.common.env_checker import check_env
 
 from ai_driving_logic import TrackmaniaRLEnvironment
+from db.experience_store import ExperienceStore
+from db.callbacks import EpisodeLoggerCallback, ReplayBufferCheckpointCallback
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -135,6 +137,16 @@ def train(args: argparse.Namespace):
         verify=args.verify_env,
     )
 
+    # ── Deneyim Veritabanı ───────────────────────────────────────────────────
+    store  = ExperienceStore(args.db_path)
+    run_id = store.create_run(
+        trajectory_path = args.trajectory,
+        checkpoint_dir  = args.checkpoint_dir,
+        total_timesteps = args.timesteps,
+        resume_path     = args.resume,
+    )
+    print(f"DB: {args.db_path}  (run_id={run_id})")
+
     # ── Callbacks ────────────────────────────────────────────────────────────
     checkpoint_dir = Path(args.checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -145,8 +157,15 @@ def train(args: argparse.Namespace):
         name_prefix="sac_tm",
         verbose=1,
     )
+    episode_logger_cb = EpisodeLoggerCallback(store, run_id, verbose=1)
+    replay_cb = ReplayBufferCheckpointCallback(
+        save_freq   = args.save_freq,
+        save_path   = checkpoint_dir,
+        name_prefix = "sac_tm",
+        verbose     = 1,
+    )
 
-    callbacks = [checkpoint_cb]
+    callbacks = [checkpoint_cb, episode_logger_cb, replay_cb]
 
     # Süre/tamamlama ile erken durdurma
     if args.max_hours > 0 or args.stop_on_finish:
@@ -167,6 +186,14 @@ def train(args: argparse.Namespace):
         print(f"Checkpoint yükleniyor: {resume_path}")
         model = SAC.load(str(resume_path), env=env, verbose=1)
         reset_timesteps = False
+
+        # Replay buffer otomatik yükle: sac_tm_5000_steps.zip → sac_tm_5000_steps_replay.pkl
+        replay_path = resume_path.parent / (resume_path.stem + "_replay.pkl")
+        if replay_path.exists():
+            model.load_replay_buffer(str(replay_path.with_suffix("")))
+            print(f"Replay buffer yuklendi: {model.replay_buffer.size()} transition")
+        else:
+            print(f"Uyari: replay buffer bulunamadi ({replay_path.name}), sifirdan baslanıyor.")
     else:
         model = SAC(
             policy="MlpPolicy",
@@ -203,9 +230,12 @@ def train(args: argparse.Namespace):
     # ── Kaydet ───────────────────────────────────────────────────────────────
     final_path = checkpoint_dir / "sac_tm_final"
     model.save(str(final_path))
+    model.save_replay_buffer(str(checkpoint_dir / "sac_tm_final_replay"))
     print(f"\nModel kaydedildi: {final_path}.zip")
+    print(f"Replay buffer kaydedildi: {checkpoint_dir}/sac_tm_final_replay.pkl")
     print(f"Devam etmek için: python train.py --trajectory {args.trajectory} --resume {final_path}.zip")
 
+    store.close()
     env.close()
 
 
@@ -261,6 +291,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--verify-env", action="store_true",
         help="Başlamadan önce gymnasium.check_env() çalıştır",
+    )
+    p.add_argument(
+        "--db-path", default="training.db", metavar="DB",
+        help="SQLite veritabani dosyasi (yoksa olusturulur)",
     )
     return p.parse_args()
 
