@@ -44,6 +44,8 @@ from stable_baselines3.common.env_checker import check_env
 
 from ai_driving_logic import TrackmaniaRLEnvironment
 from async_sac import AsyncSAC
+from db.experience_store import ExperienceStore
+from db.callbacks import EpisodeLoggerCallback, ReplayBufferCheckpointCallback
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -136,6 +138,17 @@ def train(args: argparse.Namespace):
         verify=args.verify_env,
     )
 
+    # ── Deneyim Veritabanı ───────────────────────────────────────────────────
+    # (merge sonrası kaybolmuştu; episode_logger_cb store/run_id'ye bağımlı)
+    store  = ExperienceStore(args.db_path)
+    run_id = store.create_run(
+        trajectory_path = args.trajectory,
+        checkpoint_dir  = args.checkpoint_dir,
+        total_timesteps = args.timesteps,
+        resume_path     = args.resume,
+    )
+    print(f"DB: {args.db_path}  (run_id={run_id})")
+
     # ── Callbacks ────────────────────────────────────────────────────────────
     checkpoint_dir = Path(args.checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -146,8 +159,23 @@ def train(args: argparse.Namespace):
         name_prefix="sac_tm",
         verbose=1,
     )
+    episode_logger_cb = EpisodeLoggerCallback(store, run_id, verbose=1)
+    replay_cb = ReplayBufferCheckpointCallback(
+        save_freq   = args.save_freq,
+        save_path   = checkpoint_dir,
+        name_prefix = "sac_tm",
+        verbose     = 1,
+    )
 
-    callbacks = [checkpoint_cb]
+    callbacks = [checkpoint_cb, episode_logger_cb, replay_cb]
+
+    # Canlı dashboard — ajanın aksiyon/telemetri/LIDAR'ını eğitim sırasında göster.
+    # Ayrı tmrl bağlantısı açmaz; eğitim akışındaki veriyi kullanır.
+    dashboard = None
+    if args.dashboard:
+        from ui_dashboard import DashboardCallback
+        dashboard = DashboardCallback(draw_every=args.dashboard_every, verbose=1)
+        callbacks.append(dashboard.sb3_callback)
 
     # Süre/tamamlama ile erken durdurma
     if args.max_hours > 0 or args.stop_on_finish:
@@ -214,6 +242,9 @@ def train(args: argparse.Namespace):
     print(f"\nModel kaydedildi: {final_path}.zip")
     print(f"Devam etmek için: python train.py --trajectory {args.trajectory} --resume {final_path}.zip")
 
+    if dashboard is not None:
+        dashboard.close()
+    store.close()
     env.close()
 
 
@@ -255,6 +286,10 @@ def _parse_args() -> argparse.Namespace:
         help="Checkpoint kayıt klasörü",
     )
     p.add_argument(
+        "--db-path", default="experience.db",
+        help="Deneyim/episode kayıt veritabanı (SQLite) yolu",
+    )
+    p.add_argument(
         "--log-dir", default="logs/tb",
         help="TensorBoard log klasörü",
     )
@@ -279,6 +314,15 @@ def _parse_args() -> argparse.Namespace:
         "--max-grad-per-step", type=float, default=4.0,
         help="Async modda: gerçek oyun adımı başına maks gradient adımı oranı "
              "(tmrl MAX_TRAINING_STEPS_PER_ENVIRONMENT_STEP). Bayat-veri aşırı uyumunu sınırlar",
+    )
+    p.add_argument(
+        "--dashboard", action="store_true",
+        help="Eğitim sırasında canlı pygame dashboard'u aç (aksiyon/telemetri/LIDAR). "
+             "Ayrı tmrl bağlantısı açmaz; eğitim akışındaki veriyi gösterir",
+    )
+    p.add_argument(
+        "--dashboard-every", type=int, default=1,
+        help="Dashboard'u her N adımda bir çiz (1=her adım). CPU yükü için artırılabilir",
     )
     return p.parse_args()
 

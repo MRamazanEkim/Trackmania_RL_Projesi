@@ -274,6 +274,10 @@ class TrackmaniaRLEnvironment(gymnasium.Env):
         self._tracker = None
         self._controller = DrivingController() if failure_detection else None
 
+        # Canlı dashboard için son ham obs + parse edilmiş frame (DashboardCallback okur)
+        self._last_raw_obs = None
+        self._last_frame = None
+
         # Spaces — _setup_spaces() içinde set edilir
         self._spaces_ready = False
         self._flatten_obs = False
@@ -414,6 +418,10 @@ class TrackmaniaRLEnvironment(gymnasium.Env):
         # Telemetri çıkar (x, y, z ve speed için)
         frame = self._interface.parse_observation(raw_obs, action)
         position = np.array([frame.x, frame.y, frame.z], dtype=np.float32)
+
+        # Canlı dashboard için sakla (ucuz referans atama)
+        self._last_raw_obs = raw_obs
+        self._last_frame = frame
 
         # Araç henüz spawn olmadıysa pozisyon (0,0,0) gelir. Bu frame'i nötr
         # geç: aksi halde origin referans çizgiye ~800m uzak görünür, sahte

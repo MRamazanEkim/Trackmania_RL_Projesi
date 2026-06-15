@@ -461,10 +461,15 @@ class TrackmaniaInterface:
         except (IndexError, TypeError):
             x = y = z = 0.0
 
+        # tmrl TM20 action mapping (tm_gym_interfaces.send_control):
+        #   action[0] = forward (gaz),  action[1] = backward (fren/geri),
+        #   action[2] = steering (>0.5 sağ, <-0.5 sol).
+        # NOT: eskiden burada [steering, gaz, fren] varsayılıyordu → gaz/fren ters
+        # görünüyordu. Doğrusu [gaz, fren, steering].
         action = np.asarray(action, dtype=np.float32).ravel()
-        steering = float(np.clip(action[0], -1.0,  1.0)) if len(action) > 0 else 0.0
-        throttle = float(np.clip(action[1],  0.0,  1.0)) if len(action) > 1 else 0.0
-        brake    = float(np.clip(action[2],  0.0,  1.0)) if len(action) > 2 else 0.0
+        throttle = float(np.clip(action[0],  0.0,  1.0)) if len(action) > 0 else 0.0
+        brake    = float(np.clip(action[1],  0.0,  1.0)) if len(action) > 1 else 0.0
+        steering = float(np.clip(action[2], -1.0,  1.0)) if len(action) > 2 else 0.0
 
         frame = TelemetryFrame(
             timestamp = time.time(),

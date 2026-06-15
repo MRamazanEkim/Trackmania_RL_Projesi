@@ -39,6 +39,13 @@ checkpoints/
 logs/
 episode_history.json
 
+# SQLite veritabanı
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
 # Claude Code (kişisel ayarlar)
 .claude/
 
