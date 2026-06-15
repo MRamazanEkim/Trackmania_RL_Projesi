@@ -43,6 +43,7 @@ from stable_baselines3.common.callbacks import (
 from stable_baselines3.common.env_checker import check_env
 
 from ai_driving_logic import TrackmaniaRLEnvironment
+from async_sac import AsyncSAC
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -159,16 +160,22 @@ def train(args: argparse.Namespace):
         )
 
     # ── Model ─────────────────────────────────────────────────────────────────
+    # Async modda toplama (oyun) ve öğrenme (gradient) ayrı thread'lerde
+    # örtüşür → oyun beklerken CPU boşta kalmaz. tmrl'in worker/trainer
+    # paralelizminin tek-süreç taklidi. Bkz. async_sac.py.
+    ModelCls = AsyncSAC if args.async_train else SAC
+    extra_kwargs = {"max_grad_per_step": args.max_grad_per_step} if args.async_train else {}
+
     if args.resume:
         resume_path = Path(args.resume)
         if not resume_path.exists():
             print(f"Hata: checkpoint bulunamadı: {resume_path}")
             sys.exit(1)
-        print(f"Checkpoint yükleniyor: {resume_path}")
-        model = SAC.load(str(resume_path), env=env, verbose=1)
+        print(f"Checkpoint yükleniyor: {resume_path}" + ("  [async]" if args.async_train else ""))
+        model = ModelCls.load(str(resume_path), env=env, verbose=1, **extra_kwargs)
         reset_timesteps = False
     else:
-        model = SAC(
+        model = ModelCls(
             policy="MlpPolicy",
             env=env,
             verbose=1,
@@ -176,13 +183,14 @@ def train(args: argparse.Namespace):
             # SAC hiperparametreleri — hızlı/sample-efficient öğrenme için ayarlı
             learning_rate=3e-4,
             buffer_size=200_000,
-            learning_starts=5_000,   # İlk N step random aksiyon (keşif) — buffer'ı ileri sürüş örnekleriyle doldur
+            learning_starts=2_000,   # İlk N step random aksiyon (keşif) — buffer'ı ileri sürüş örnekleriyle doldur. Oyun yavaş olduğu için erken öğrenmeye başla.
             batch_size=256,
             tau=0.005,
             gamma=0.99,
             train_freq=1,
-            gradient_steps=2,        # her gerçek adımda 2 güncelleme → az dakikada çok öğren
+            gradient_steps=4,        # her gerçek adımda 4 güncelleme → aynı oyun süresinde daha çok öğren (CPU'da güncelleme yavaş ama oyun darboğaz)
             ent_coef="auto",         # entropy katsayısı otomatik → otomatik keşif dengesi
+            **extra_kwargs,
         )
         reset_timesteps = True
 
@@ -261,6 +269,16 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--verify-env", action="store_true",
         help="Başlamadan önce gymnasium.check_env() çalıştır",
+    )
+    p.add_argument(
+        "--async", dest="async_train", action="store_true",
+        help="Eşzamanlı toplama+öğrenme (AsyncSAC). Oyun beklerken CPU öğrenir "
+             "→ aynı duvar-saatinde daha çok gradient. tmrl worker/trainer taklidi.",
+    )
+    p.add_argument(
+        "--max-grad-per-step", type=float, default=4.0,
+        help="Async modda: gerçek oyun adımı başına maks gradient adımı oranı "
+             "(tmrl MAX_TRAINING_STEPS_PER_ENVIRONMENT_STEP). Bayat-veri aşırı uyumunu sınırlar",
     )
     return p.parse_args()
 
