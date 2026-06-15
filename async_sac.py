@@ -161,8 +161,8 @@ class AsyncSAC(SAC):
                     self._collected_steps += env.num_envs
 
                     # Callback ana thread değil burada çağrılır; SB3 callback'leri
-                    # genelde thread-safe değil ama bizim StopOnTimeOrCompletion
-                    # yalnız okuma + zaman kontrolü yapıyor → güvenli.
+                    # genelde thread-safe değil ama bizim callback'lerimiz (dashboard
+                    # çizimi, durma kontrolü) yalnız okuma yaptığı için güvenli.
                     callback.update_locals(locals())
                     if not callback.on_step():
                         self._continue_training = False

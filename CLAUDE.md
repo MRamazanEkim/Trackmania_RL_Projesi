@@ -6,15 +6,23 @@ Bitirme projesi. Amaç: kayıtlı verilerle RL algoritması geliştirmek ve arac
 ## Mimari
 
 ```
-train.py
-  └─► TrackmaniaRLEnvironment  (ai_driving_logic.py)   ← gymnasium.Env
+population_train.py  (popülasyon + elitizm; ana eğitim girişi)
+  ├─► AsyncSAC               (async_sac.py)         ← eşzamanlı toplama+öğrenme
+  ├─► ExperienceStore        (db/experience_store.py) ← generations/episodes (SQLite)
+  ├─► DashboardCallback      (ui_dashboard.py)      ← canlı LIDAR+telemetri (opsiyonel)
+  └─► TrackmaniaRLEnvironment (ai_driving_logic.py) ← gymnasium.Env
         ├─► TrackmaniaInterface  (telemetry_monitor.py) ← tmrl wrapper
         ├─► ProgressTracker      (progress_tracker.py)  ← waypoint reward
         └─► DrivingController    (ai_driving_logic.py)  ← failure detection
 ```
 
+**Eğitim modeli:** Popülasyon + elitizm. Her jenerasyonda N aday SIRAYLA tur atar
+(TM tek oyun penceresi), en iyi aday `best.zip` olarak korunur ve sonraki neslin
+ebeveyni olur. best asla geriye gitmez → her nesil ≥ önceki.
+
 **Observation:** tmrl LIDAR (~26 float, flat Box) — hız + 19 LIDAR ışını + action buffer  
-**Action:** `[steering, gas, brake]` — her biri float, tmrl üzerinden doğrudan oyun motoruna gönderilir  
+**Action:** `[gas, brake, steering]` — tmrl üzerinden doğrudan oyun motoruna gönderilir
+(tmrl mapping: idx0=ileri/gaz, idx1=geri/fren, idx2=direksiyon)  
 **Reward:** Araç yeni waypoint geçtikçe +1, tamamlama bonusu +50  
 **Episode sonu:** tmrl terminated/truncated VEYA DrivingController: ZERO_SPEED / STUCK / REVERSE
 
@@ -57,18 +65,21 @@ python record_trajectory.py --process
 
 `trajectory_logs/` klasörüne `raw_..._reference.csv` dosyası oluşur.
 
-### 2. Eğitimi Başlat
+### 2. Eğitimi Başlat (popülasyon + elitizm)
 
 ```bat
-python train.py --trajectory trajectory_logs/raw_..._reference.csv
+python population_train.py --trajectory trajectory_logs/raw_..._reference.csv --async --dashboard
 ```
 
-Her 5000 adımda `checkpoints/` klasörüne kayıt yapılır.
+Faydalı bayraklar: `--pop-size N` (aday sayısı), `--generations G`, `--learn-steps S`
+(aday başına öğrenme adımı), `--eval-episodes E`, `--mutation-std`, `--async`
+(eşzamanlı toplama+öğrenme), `--dashboard` (canlı pencere).
+En iyi model her zaman `checkpoints/pop/best.zip` olarak korunur.
 
-### 3. Checkpoint'ten Devam Et
+### 3. Devam Et (mevcut best'ten)
 
 ```bat
-python train.py --trajectory trajectory_logs/raw_..._reference.csv --resume checkpoints/sac_tm_5000_steps.zip
+python population_train.py --trajectory trajectory_logs/raw_..._reference.csv --resume checkpoints/pop/best.zip --async
 ```
 
 ### 4. TensorBoard ile İzle
@@ -89,11 +100,14 @@ python telemetry_monitor.py --trajectory trajectory_logs/raw_..._reference.csv
 
 | Dosya | Açıklama |
 |---|---|
-| `train.py` | SB3 SAC eğitim scripti — buradan başla |
+| `population_train.py` | Popülasyon + elitizm eğitimi — **buradan başla** |
+| `async_sac.py` | AsyncSAC — eşzamanlı toplama+öğrenme (oyun beklerken öğren) |
 | `ai_driving_logic.py` | `TrackmaniaRLEnvironment` (gymnasium.Env) + `DrivingController` |
+| `db/experience_store.py` | SQLite: `generations` (elitizm) + `episodes` tabloları |
+| `ui_dashboard.py` | Canlı LIDAR radar + telemetri (gömülü `DashboardCallback` veya bağımsız) |
 | `progress_tracker.py` | KDTree tabanlı waypoint ilerleme ödülü — değiştirme |
 | `record_trajectory.py` | Manuel tur kaydı aracı |
-| `telemetry_monitor.py` | Gerçek zamanlı telemetri dashboard + loglama |
+| `telemetry_monitor.py` | tmrl wrapper (`TrackmaniaInterface`) + telemetri loglama |
 | `requirements.txt` | Python bağımlılıkları |
 
 ## Kendi Ajanını Geliştirme
@@ -101,13 +115,14 @@ python telemetry_monitor.py --trajectory trajectory_logs/raw_..._reference.csv
 Şu an SB3 SAC kullanılıyor. Kendi RL ajanını entegre etmek için:
 
 1. `TrackmaniaRLEnvironment` değişmez — gymnasium.Env arayüzü sabit kalır
-2. `train.py`'da `SAC` yerine kendi modelini kullan:
+2. `population_train.py` içindeki `new_model()` / `ModelCls` kısmında `AsyncSAC`
+   yerine kendi modelini kullan:
 
 ```python
-# train.py içinde, model oluşturma kısmını değiştir:
+# population_train.py içinde model oluşturmayı değiştir:
 from my_agent import MyAgent
 model = MyAgent(env)
-model.learn(total_timesteps=args.timesteps)
+model.learn(total_timesteps=...)
 ```
 
 Ortam `reset()` → `(obs, info)`, `step(action)` → `(obs, reward, terminated, truncated, info)` döndürür.

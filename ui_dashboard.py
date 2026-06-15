@@ -551,7 +551,7 @@ class DashboardCallback:
         self._initialized = True
 
     def _tick(self, inner) -> bool:
-        # Eğitim ortamını bir kez çöz
+        # Eğitim ortamını bir kez çöz (SB3 callback yolu)
         if self._tm_env is None:
             self._tm_env = _unwrap_tm_env(inner.training_env)
             self._tracker = getattr(self._tm_env, "_tracker", None)
@@ -559,20 +559,30 @@ class DashboardCallback:
         self._n += 1
         if self._n % self._draw_every != 0:
             return True
+        return self._render(self._tm_env)
 
+    def tick_external(self, tm_env) -> bool:
+        """
+        SB3 learn() döngüsü dışından (ör. popülasyon değerlendirme rollout'u)
+        bir kare çiz. Doğrudan TrackmaniaRLEnvironment verilir.
+        Dönüş False → pencere kapatıldı/ESC.
+        """
+        return self._render(tm_env)
+
+    def _render(self, tm_env) -> bool:
         if not self._initialized:
             self._lazy_init()
 
-        # Pencere kapatma / ESC → eğitimi durdur
+        # Pencere kapatma / ESC → çağırana dur sinyali
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 return False
             if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                 return False
 
-        raw_obs = getattr(self._tm_env, "_last_raw_obs", None)
-        frame = getattr(self._tm_env, "_last_frame", None)
-        tracker = getattr(self._tm_env, "_tracker", None)
+        raw_obs = getattr(tm_env, "_last_raw_obs", None)
+        frame = getattr(tm_env, "_last_frame", None)
+        tracker = getattr(tm_env, "_tracker", None)
 
         screen, (fL, fM, fS) = self._screen, self._fonts
         fonts = (fL, fM, fS)

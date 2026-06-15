@@ -39,6 +39,7 @@ class ExperienceStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._create_schema()
+        self._migrate()
 
     # ── Schema ────────────────────────────────────────────────────────────────
 
@@ -51,6 +52,7 @@ class ExperienceStore:
                 resume_path     TEXT,
                 checkpoint_dir  TEXT    NOT NULL,
                 total_timesteps INTEGER NOT NULL,
+                algorithm       TEXT    NOT NULL DEFAULT 'sac',
                 notes           TEXT
             );
 
@@ -65,12 +67,58 @@ class ExperienceStore:
                 progress_pct      REAL    NOT NULL,
                 lap_complete      INTEGER NOT NULL,
                 failure_reason    TEXT    NOT NULL DEFAULT '',
+                algorithm         TEXT    NOT NULL DEFAULT 'sac',
+                lap_time_s        REAL    NOT NULL DEFAULT 0.0,
+                collision         INTEGER NOT NULL DEFAULT 0,
                 ended_at          TEXT    NOT NULL
             );
 
             CREATE INDEX IF NOT EXISTS idx_episodes_run_id ON episodes(run_id);
             CREATE INDEX IF NOT EXISTS idx_episodes_step   ON episodes(global_step);
+
+            -- Popülasyon + elitizm: her satır bir adayın bir jenerasyondaki değerlendirmesi.
+            -- candidate_idx = -1 → o nesle değişmeden taşınan elit (best).
+            -- is_best = 1 → o jenerasyonun kazananı (sonraki neslin ebeveyni).
+            CREATE TABLE IF NOT EXISTS generations (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id          INTEGER NOT NULL REFERENCES training_runs(id),
+                gen_no          INTEGER NOT NULL,
+                candidate_idx   INTEGER NOT NULL,
+                mean_reward     REAL    NOT NULL,
+                best_reward     REAL    NOT NULL,
+                mean_progress   REAL    NOT NULL,
+                best_progress   REAL    NOT NULL,
+                eval_episodes   INTEGER NOT NULL,
+                lap_completed   INTEGER NOT NULL DEFAULT 0,
+                is_best         INTEGER NOT NULL DEFAULT 0,
+                model_path      TEXT    NOT NULL DEFAULT '',
+                parent_gen      INTEGER,
+                algorithm       TEXT    NOT NULL DEFAULT 'sac',
+                created_at      TEXT    NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_gen_run  ON generations(run_id);
+            CREATE INDEX IF NOT EXISTS idx_gen_no   ON generations(run_id, gen_no);
         """)
+        self._conn.commit()
+
+    def _migrate(self) -> None:
+        """
+        Eski DB'lere yeni kolonları geriye-uyumlu ekle (CREATE TABLE IF NOT EXISTS
+        mevcut tabloya kolon eklemez). Kolon zaten varsa sessizce geç.
+        """
+        add = [
+            ("training_runs", "algorithm", "TEXT NOT NULL DEFAULT 'sac'"),
+            ("episodes",      "algorithm", "TEXT NOT NULL DEFAULT 'sac'"),
+            ("episodes",      "lap_time_s", "REAL NOT NULL DEFAULT 0.0"),
+            ("episodes",      "collision",  "INTEGER NOT NULL DEFAULT 0"),
+            ("generations",   "algorithm", "TEXT NOT NULL DEFAULT 'sac'"),
+        ]
+        for table, col, decl in add:
+            try:
+                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+            except sqlite3.OperationalError:
+                pass  # kolon zaten var
         self._conn.commit()
 
     # ── Training runs ─────────────────────────────────────────────────────────
@@ -82,14 +130,17 @@ class ExperienceStore:
         total_timesteps: int,
         resume_path:     Optional[str] = None,
         notes:           Optional[str] = None,
+        algorithm:       str = "sac",
     ) -> int:
         cur = self._conn.execute(
             """
             INSERT INTO training_runs
-                (started_at, trajectory_path, resume_path, checkpoint_dir, total_timesteps, notes)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (started_at, trajectory_path, resume_path, checkpoint_dir,
+                 total_timesteps, algorithm, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (_utcnow(), trajectory_path, resume_path, checkpoint_dir, total_timesteps, notes),
+            (_utcnow(), trajectory_path, resume_path, checkpoint_dir,
+             total_timesteps, algorithm, notes),
         )
         self._conn.commit()
         return cur.lastrowid
@@ -107,20 +158,130 @@ class ExperienceStore:
         progress_pct:      float,
         lap_complete:      bool,
         failure_reason:    str,
+        algorithm:         str = "sac",
+        lap_time_s:        float = 0.0,
+        collision:         bool = False,
     ) -> None:
         self._conn.execute(
             """
             INSERT INTO episodes
                 (run_id, episode_number, global_step, cumulative_reward, steps,
-                 furthest_waypoint, progress_pct, lap_complete, failure_reason, ended_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 furthest_waypoint, progress_pct, lap_complete, failure_reason,
+                 algorithm, lap_time_s, collision, ended_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run_id, episode_number, global_step, cumulative_reward, steps,
-                furthest_waypoint, progress_pct, int(lap_complete), failure_reason, _utcnow(),
+                furthest_waypoint, progress_pct, int(lap_complete), failure_reason,
+                algorithm, lap_time_s, int(collision), _utcnow(),
             ),
         )
         self._conn.commit()
+
+    # ── Generations (popülasyon + elitizm) ─────────────────────────────────────
+
+    def log_candidate(
+        self,
+        run_id:        int,
+        gen_no:        int,
+        candidate_idx: int,
+        mean_reward:   float,
+        best_reward:   float,
+        mean_progress: float,
+        best_progress: float,
+        eval_episodes: int,
+        lap_completed: bool = False,
+        is_best:       bool = False,
+        model_path:    str = "",
+        parent_gen:    Optional[int] = None,
+        algorithm:     str = "sac",
+    ) -> int:
+        """Bir adayın bir jenerasyondaki değerlendirme sonucunu kaydet."""
+        cur = self._conn.execute(
+            """
+            INSERT INTO generations
+                (run_id, gen_no, candidate_idx, mean_reward, best_reward,
+                 mean_progress, best_progress, eval_episodes, lap_completed,
+                 is_best, model_path, parent_gen, algorithm, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id, gen_no, candidate_idx, mean_reward, best_reward,
+                mean_progress, best_progress, eval_episodes, int(lap_completed),
+                int(is_best), model_path, parent_gen, algorithm, _utcnow(),
+            ),
+        )
+        self._conn.commit()
+        return cur.lastrowid
+
+    def mark_best(self, row_id: int) -> None:
+        """Bir generations satırını o jenerasyonun kazananı olarak işaretle."""
+        self._conn.execute("UPDATE generations SET is_best=1 WHERE id=?", (row_id,))
+        self._conn.commit()
+
+    def best_overall(self, run_id: int) -> Optional[dict]:
+        """
+        Bir koşudaki TÜM jenerasyonlar arasında en iyi adayı döner.
+        Sıralama: önce tur tamamlama, sonra ilerleme, sonra ödül.
+        Elitizmin kalbi: sonraki nesil bunun model_path'inden türer.
+        """
+        row = self._conn.execute(
+            """
+            SELECT * FROM generations WHERE run_id=?
+            ORDER BY lap_completed DESC, best_progress DESC, best_reward DESC
+            LIMIT 1
+            """,
+            (run_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def generation_summary(self, run_id: int) -> list[dict]:
+        """
+        Her jenerasyon için kazananın özeti (gen_no artan).
+        'Her nesilde iyileşme'yi izlemek için: best_progress sütunu nesil
+        boyunca azalmamalı (elitizm garantisi).
+        """
+        rows = self._conn.execute(
+            """
+            SELECT gen_no,
+                   MAX(best_progress) AS gen_best_progress,
+                   MAX(best_reward)   AS gen_best_reward,
+                   MAX(lap_completed) AS any_lap
+            FROM generations WHERE run_id=?
+            GROUP BY gen_no ORDER BY gen_no
+            """,
+            (run_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── Algoritma karşılaştırması (DQN vs PPO vs SAC) ──────────────────────────
+
+    def algorithm_comparison(self) -> list[dict]:
+        """
+        Algoritma başına özet metrikler — özetin 'eşit koşullarda karşılaştırma'
+        tablosu. episodes tablosundan algoritma bazında toplar:
+          • episode sayısı
+          • pist tamamlama oranı (lap_complete ortalaması)
+          • ortalama/en iyi ilerleme %
+          • çarpışma oranı (collision ortalaması)
+          • tamamlanan turların ortalama süresi (lap_time_s, sadece lap=1)
+          • ortalama ödül
+        """
+        rows = self._conn.execute(
+            """
+            SELECT algorithm,
+                   COUNT(*)                                   AS episodes,
+                   AVG(lap_complete)                          AS completion_rate,
+                   AVG(progress_pct)                          AS mean_progress,
+                   MAX(progress_pct)                          AS best_progress,
+                   AVG(collision)                             AS collision_rate,
+                   AVG(CASE WHEN lap_complete=1 THEN lap_time_s END) AS mean_lap_time,
+                   AVG(cumulative_reward)                     AS mean_reward
+            FROM episodes
+            GROUP BY algorithm ORDER BY completion_rate DESC, best_progress DESC
+            """
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     # ── Sorgular ──────────────────────────────────────────────────────────────
 
