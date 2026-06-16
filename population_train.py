@@ -39,6 +39,7 @@ Kullanım
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -170,16 +171,35 @@ def population_train(args: argparse.Namespace):
     if seed_path and Path(seed_path).exists():
         print(f"Başlangıç eliti yükleniyor: {seed_path}")
         elite = ModelCls.load(seed_path, env=env, **extra_kwargs)
+        # Tüm önceki koşuların en iyisini göster — zincirin nereden devam ettiği net olsun.
+        prev_global = store.best_overall_global()
+        if prev_global:
+            print(f"  ↳ Geçmiş en iyi (tüm koşular): "
+                  f"ilerleme={prev_global['best_progress']:.1f}%  "
+                  f"ödül={prev_global['best_reward']:.1f}  "
+                  f"tur={'Evet' if prev_global['lap_completed'] else 'Hayır'}")
+        trend = store.global_generation_trend()
+        if trend:
+            t_str = "  ".join(
+                f"run{r['run_id']}/g{r['gen_no']}:{r['gen_best_progress']:.1f}%"
+                for r in trend[-6:]  # son 6 nesil
+            )
+            print(f"  ↳ Geçmiş nesil trendi: {t_str}")
     else:
         print("Başlangıç eliti: sıfırdan rastgele model.")
     elite.save(str(best_path))
 
-    best_overall = store.best_overall(run_id)  # None (yeni koşu)
-
     # ── Jenerasyon döngüsü ───────────────────────────────────────────────────
     try:
         for gen in range(args.generations):
-            print(f"\n{'='*60}\nJENERASYON {gen}  (pop={args.pop_size})\n{'='*60}")
+            # Jenerasyon başında mevcut en iyiyi göster → "öncekinden öğreniyorum" zinciri
+            _cur_best = store.best_overall(run_id)
+            _cur_prog = f"{_cur_best['best_progress']:.1f}%" if _cur_best else "—"
+            print(f"\n{'='*60}")
+            print(f"JENERASYON {gen}  (pop={args.pop_size})")
+            print(f"  Başlangıç eliti: {_cur_prog} ilerleme  "
+                  f"— aday {1}-{args.pop_size - 1} bu modelden öğrenir")
+            print(f"{'='*60}")
             gen_rows = []   # (db_row_id, score_tuple, model_path)
 
             for cand in range(args.pop_size):
@@ -231,7 +251,6 @@ def population_train(args: argparse.Namespace):
             # Elitizm: best.zip = TÜM nesiller arası en iyi (yeni kazanan dahil).
             # best_overall yeni kazananı da içerir; daha kötüyse önceki en iyi korunur
             # → best.zip asla geriye gitmez.
-            import shutil
             global_best = store.best_overall(run_id)
             shutil.copyfile(global_best["model_path"], str(best_path))
             print(f"\n  → Nesil {gen} kazananı: ilerleme={win_score[1]:.1f}% ödül={win_score[2]:.1f}")

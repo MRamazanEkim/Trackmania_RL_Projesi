@@ -278,6 +278,7 @@ class AsyncSAC(SAC):
         self._collector_thread.start()
 
         grad_steps_done = 0
+        interrupted = False
         try:
             while self.num_timesteps < total_timesteps and self._continue_training:
                 # Yeterli warm-up toplanana dek öğrenme; sadece bekle
@@ -302,6 +303,7 @@ class AsyncSAC(SAC):
                     self._sync_collector_policy()
         except KeyboardInterrupt:
             print("\n[AsyncSAC] Ana thread durduruldu (KeyboardInterrupt).")
+            interrupted = True
         finally:
             # Collector'ı durdur ve bekle
             self._stop_event.set()
@@ -309,4 +311,10 @@ class AsyncSAC(SAC):
                 self._collector_thread.join(timeout=10.0)
 
         callback.on_training_end()
+        # KeyboardInterrupt'i YUTMA — yukarı ilet ki population_train'in dış
+        # döngüsü (try/except KeyboardInterrupt) tüm eğitimi durdurabilsin.
+        # Aksi halde interrupt burada yutulur, bir sonraki aday/jenerasyon başlar
+        # ve eğitim "durmadan" devam eder.
+        if interrupted:
+            raise KeyboardInterrupt
         return self

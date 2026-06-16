@@ -323,6 +323,40 @@ class ExperienceStore:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def best_overall_global(self) -> Optional[dict]:
+        """
+        Tüm koşular arasında en iyi adayı döner (çapraz-run elitizm için).
+        Dosyanın gerçekten var olup olmadığını kontrol etmez — çağıran kontrol etmeli.
+        Sıralama: önce tur tamamlama, sonra ilerleme %, sonra ödül.
+        """
+        row = self._conn.execute("""
+            SELECT g.*, r.started_at
+            FROM   generations g
+            JOIN   training_runs r ON r.id = g.run_id
+            WHERE  g.model_path != ''
+            ORDER  BY g.lap_completed DESC, g.best_progress DESC, g.best_reward DESC
+            LIMIT  1
+        """).fetchone()
+        return dict(row) if row else None
+
+    def global_generation_trend(self) -> list[dict]:
+        """
+        Tüm koşuların jenerasyon trendini döner (her nesildeki en iyi ilerleme).
+        start.py özet banner'ı için kullanılır.
+        """
+        rows = self._conn.execute("""
+            SELECT r.id AS run_id,
+                   g.gen_no,
+                   MAX(g.best_progress) AS gen_best_progress,
+                   MAX(g.best_reward)   AS gen_best_reward,
+                   MAX(g.lap_completed) AS any_lap
+            FROM   generations g
+            JOIN   training_runs r ON r.id = g.run_id
+            GROUP  BY r.id, g.gen_no
+            ORDER  BY r.id, g.gen_no
+        """).fetchall()
+        return [dict(r) for r in rows]
+
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def close(self) -> None:
