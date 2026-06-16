@@ -3,10 +3,14 @@ start.py
 ========
 Trackmania RL — tek-komut başlatıcı (sürekli SAC eğitimi).
 
-    python start.py                # tam otomatik: en iyiden devam, sürekli öğren
-    python start.py --steps 200000 # bu oturumda öğrenilecek adım sayısı
+    python start.py                # tam otomatik: en iyiden devam, sürekli döngü
+    python start.py --steps 10000  # tur başına adım (her tur sonunda kaydeder)
     python start.py --no-async     # AsyncSAC yerine standart SAC
     python start.py --no-dashboard # UI penceresi açmadan sadece eğit
+
+  Otomatik döngü: her tur (--steps adım) bitince kaydedip yeni tura geçer,
+  Ctrl+C ile durdurana kadar sürekli öğrenir. Gece bırakılabilir; her turda
+  kayıt alındığı için durdurunca ilerleme korunur.
 
 Ne yapar?
 ---------
@@ -333,28 +337,43 @@ def sac_continue(args) -> None:
         dashboard = DashboardCallback(draw_every=args.dashboard_every, verbose=0)
         callbacks.append(dashboard.sb3_callback)
 
-    # ── Eğit ────────────────────────────────────────────────────────────────────
-    print(f"\nEğitim başlıyor (steps={args.steps:,}). Ctrl+C ile durdurabilirsin.")
+    # ── Kaydetme yardımcısı (her tur sonunda çağrılır → ilerleme korunur) ───────
+    def _save():
+        model.save(str(best_path.with_suffix("")))
+        try:
+            model.save_replay_buffer(str(replay_path.with_suffix("")))
+        except Exception as exc:  # noqa: BLE001
+            print(f"Replay buffer kaydedilemedi (yok sayıldı): {exc}")
+
+    # ── Eğit — otomatik döngü ───────────────────────────────────────────────────
+    # Her tur args.steps kadar öğrenir, kaydeder, sonra yeni tura geçer.
+    # Sen Ctrl+C ile durdurana kadar sürekli döner; her tur sonunda kayıt
+    # alındığı için durdurduğunda ilerleme korunur (gece bırakılabilir).
+    print(f"\nOtomatik döngü başladı (tur başına {args.steps:,} adım). "
+          f"Ctrl+C ile durdur — ilerleme her turda kaydedilir.")
     t0 = time.time()
+    round_no = 0
     try:
-        model.learn(total_timesteps=args.steps, callback=callbacks,
-                    reset_num_timesteps=False)
+        while True:
+            round_no += 1
+            print(f"\n── Tur {round_no} (toplam adım: {model.num_timesteps:,}) ──")
+            model.learn(total_timesteps=args.steps, callback=callbacks,
+                        reset_num_timesteps=False)
+            _save()
+            best = store.best_progress(run_id)
+            best_pct = best["progress_pct"] if best else 0.0
+            print(f"  Tur {round_no} bitti, kaydedildi. En iyi ilerleme: {best_pct:.1f}%")
     except KeyboardInterrupt:
-        print("\nEğitim durduruldu (Ctrl+C).")
+        print("\nDöngü durduruldu (Ctrl+C). Son durum kaydediliyor…")
+        _save()
     dt = time.time() - t0
 
-    # ── Kaydet: bir sonraki başlatış buradan devam etsin ───────────────────────
     if dashboard is not None:
         dashboard.close()
-    model.save(str(best_path.with_suffix("")))
-    try:
-        model.save_replay_buffer(str(replay_path.with_suffix("")))
-    except Exception as exc:  # noqa: BLE001
-        print(f"Replay buffer kaydedilemedi (yok sayıldı): {exc}")
 
     best = store.best_progress(run_id)
     best_pct = best["progress_pct"] if best else 0.0
-    print(f"\nBitti ({dt:.0f}s). Bu oturumun en iyi ilerlemesi: {best_pct:.1f}%")
+    print(f"\nBitti ({dt:.0f}s, {round_no} tur). En iyi ilerleme: {best_pct:.1f}%")
     print(f"Model kaydedildi: {best_path}  → bir sonraki 'python start.py' buradan devam eder.")
 
     store.close()
@@ -378,8 +397,9 @@ def main() -> None:
                    default=None, metavar="CSV",
                    help="Referans waypoint CSV (otomatik bulunur)")
     p.add_argument("--steps",
-                   type=int, default=1_000_000,
-                   help="Bu oturumda öğrenilecek adım sayısı (Ctrl+C ile erken durdurabilirsin)")
+                   type=int, default=10_000,
+                   help="Tur başına adım sayısı; her tur sonunda kaydedip döngüye devam eder "
+                        "(Ctrl+C ile durdur)")
     p.add_argument("--save-freq",
                    type=int, default=5_000,
                    help="Ara checkpoint kayıt sıklığı (adım)")
