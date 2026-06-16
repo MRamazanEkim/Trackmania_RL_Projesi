@@ -91,6 +91,19 @@ class AsyncSAC(SAC):
         self._collector_policy = None
         self._policy_sync_lock = threading.Lock()
 
+    # ── Kaydetme — pickle'lanamayan thread/lock alanlarını dışla ─────────────
+
+    def _excluded_save_params(self) -> list[str]:
+        """
+        model.save() tüm __dict__'i pickle'lar. AsyncSAC'in thread/lock/event
+        ve collector policy kopyası alanları pickle'lanamaz ('_thread.lock')
+        → bunları kayıttan dışla. Yükleyince learn() yeniden kurar.
+        """
+        return super()._excluded_save_params() + [
+            "_buffer_lock", "_policy_sync_lock", "_stop_event",
+            "_collector_thread", "_collector_policy",
+        ]
+
     # ── Collector policy (ayrı kopya) ────────────────────────────────────────
 
     def _sync_collector_policy(self):
