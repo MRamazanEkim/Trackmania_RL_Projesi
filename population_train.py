@@ -275,6 +275,12 @@ def population_train(args: argparse.Namespace):
             print(f"best.zip: {best_path}")
         store.close()
         env.close()
+        # DB kaybolma ihtimaline karşı local metin log yedeği (commitlenmez)
+        try:
+            from export_logs import export
+            export(args.db_path, "training_logs")
+        except Exception as exc:  # noqa: BLE001
+            print(f"Log yedeği alınamadı (yok sayıldı): {exc}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -259,6 +259,13 @@ def main(args):
     print_report(store)
     store.close()
 
+    # DB kaybolma ihtimaline karşı local metin log yedeği (commitlenmez)
+    try:
+        from export_logs import export
+        export(args.db_path, "training_logs")
+    except Exception as exc:  # noqa: BLE001
+        print(f"Log yedeği alınamadı (yok sayıldı): {exc}")
+
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(

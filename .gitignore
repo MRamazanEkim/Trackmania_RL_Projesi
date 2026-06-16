@@ -44,6 +44,9 @@ episode_history.json
 *.db-shm
 *.db-wal
 *.sqlite
+
+# Eğitim log yedekleri (DB'den export — yalnız localde, commitlenmez)
+training_logs/
 *.sqlite3
 
 # Claude Code (kişisel ayarlar)
