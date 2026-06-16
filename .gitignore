@@ -44,6 +44,7 @@ episode_history.json
 *.db-shm
 *.db-wal
 *.sqlite
+*.bak
 
 # Eğitim log yedekleri (DB'den export — yalnız localde, commitlenmez)
 training_logs/

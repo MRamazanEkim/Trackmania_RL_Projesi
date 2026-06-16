@@ -1,29 +1,28 @@
 """
 start.py
 ========
-Trackmania RL — tek-komut başlatıcı.
+Trackmania RL — tek-komut başlatıcı (sürekli SAC eğitimi).
 
-    python start.py                          # tam otomatik
-    python start.py --generations 20         # jenerasyon sayısını geçersiz kıl
-    python start.py --pop-size 3             # popülasyon boyutunu geçersiz kıl
-    python start.py --learn-steps 5000       # aday başına öğrenme adımı
-    python start.py --no-async               # AsyncSAC olmadan (daha yavaş ama daha kararlı)
-    python start.py --no-dashboard           # UI penceresi açmadan sadece eğit
+    python start.py                # tam otomatik: en iyiden devam, sürekli öğren
+    python start.py --steps 200000 # bu oturumda öğrenilecek adım sayısı
+    python start.py --no-async     # AsyncSAC yerine standart SAC
+    python start.py --no-dashboard # UI penceresi açmadan sadece eğit
 
 Ne yapar?
 ---------
-1. experience.db okunur → önceki koşuların en iyi modeli ve geçmiş bulunur.
-2. En iyi checkpoint (best.zip veya DB'deki/checkpoints'teki en iyi aday)
-   --resume olarak kullanılır. Her yeni jenerasyon öncekinin üzerine öğrenir.
-3. trajectory_logs/ içinden referans CSV otomatik seçilir (en büyük _reference.csv).
-4. Pygame UI dashboard + popülasyon eğitimi aynı anda başlar (DashboardCallback).
+1. trajectory_logs/ içinden referans CSV otomatik seçilir.
+2. En iyi SAC modeli bulunur (checkpoints/sac_continue/best.zip → yoksa
+   checkpoints/sac/sac_final.zip) ve ondan DEVAM edilir — baştan başlamaz.
+3. Varsa deneyim hafızası (replay buffer) yüklenir.
+4. Pygame dashboard + SAC eğitimi aynı anda çalışır.
+5. Bitince (Ctrl+C veya --steps) model + replay buffer
+   checkpoints/sac_continue/best.zip'e yazılır.
 
-Elitizm garantisi
------------------
-  • Her jenerasyon içinde aday 0 = değişmemiş elit kopyası (regresyon yok).
-  • Jenerasyon kazananı TÜM nesiller arası en iyiyle kıyaslanır → best.zip asla
-    geriye gitmez. Yani: her jenerasyon ≥ önceki.
-  • Bu script yeniden çalıştırıldığında best.zip'ten devam → zincir kopmaz.
+Sürekli iyileşme
+----------------
+  • Her çalıştırma öncekinin bıraktığı yerden sürer → öğrenme birikir.
+  • İlerleme zinciri: %12 → %25 → ... → %100, sonra tur süresini kısaltma.
+  • Sen de bir başkası da aynı 'python start.py' ile aynı modeli ilerletir.
 """
 
 from __future__ import annotations
@@ -90,12 +89,10 @@ _ensure_venv()
 # ── Varsayılanlar ─────────────────────────────────────────────────────────────
 _DEFAULT_DB       = "experience.db"
 _DEFAULT_CHKDIR   = "checkpoints/pop"
+# Sürekli SAC ajanının kalıcı modeli burada tutulur (best.zip + replay buffer).
+# Her start.py bitişinde güncellenir → sonraki başlatış buradan devam eder.
+CONTINUE_DIR      = "checkpoints/sac_continue"
 _DEFAULT_LOGDIR   = "logs/tb"
-_DEFAULT_POP      = 4
-_DEFAULT_GENS     = 10
-_DEFAULT_STEPS    = 3_000
-_DEFAULT_EVAL_EP  = 2
-_DEFAULT_MUT_STD  = 0.0
 _DEFAULT_WP_SPC   = 1.0
 
 
@@ -147,34 +144,31 @@ def _db_history(db_path: str) -> tuple[list[dict], dict | None]:
     conn.row_factory = sqlite3.Row
 
     try:
+        # Koşu özeti episodes tablosundan (SAC-continue episodes'a yazar).
         runs = conn.execute("""
             SELECT r.id,
                    r.started_at,
                    r.notes,
                    r.algorithm,
-                   COUNT(DISTINCT g.gen_no)  AS gen_count,
-                   MAX(g.best_progress)       AS best_progress,
-                   MAX(g.best_reward)         AS best_reward,
-                   MAX(g.lap_completed)       AS any_lap
+                   COUNT(e.id)              AS gen_count,
+                   MAX(e.progress_pct)      AS best_progress,
+                   MAX(e.cumulative_reward) AS best_reward,
+                   MAX(e.lap_complete)      AS any_lap
             FROM   training_runs r
-            LEFT JOIN generations g ON g.run_id = r.id
+            LEFT JOIN episodes e ON e.run_id = r.id
             GROUP  BY r.id
             ORDER  BY r.id DESC
         """).fetchall()
         run_list = [dict(r) for r in runs]
 
-        # Global en iyi aday — model_path dosyası gerçekten varlığı kontrol edilir
-        cands = conn.execute("""
-            SELECT * FROM generations
-            WHERE  model_path != ''
-            ORDER  BY lap_completed DESC, best_progress DESC, best_reward DESC
-        """).fetchall()
-        best_cand = None
-        for c in cands:
-            d = dict(c)
-            if Path(d["model_path"]).exists():
-                best_cand = d
-                break
+        # Tüm koşuların en iyi ilerlemesi (banner ★ satırı için).
+        row = conn.execute("""
+            SELECT MAX(progress_pct) AS best_progress,
+                   MAX(cumulative_reward) AS best_reward,
+                   MAX(lap_complete) AS lap_completed
+            FROM   episodes
+        """).fetchone()
+        best_cand = dict(row) if row and row["best_progress"] is not None else None
     except sqlite3.Error:
         run_list, best_cand = [], None
 
@@ -186,30 +180,24 @@ def _db_history(db_path: str) -> tuple[list[dict], dict | None]:
 
 def _find_resume(best_cand: dict | None, chk_dir: str) -> str | None:
     """
-    Başlangıç eliti olarak kullanılacak checkpoint'i döner.
+    Devam edilecek SAC modelini döner — "her başlatışta en iyiden devam".
     Öncelik:
-      1. checkpoints/pop/best.zip   → popülasyon eğitiminin tüm-zamanlar en iyisi
-      2. DB'deki global en iyi adayın model_path'i
-      3. checkpoints/sac/sac_final.zip → SAC compare_train'den gelen son model
-      4. checkpoints/ altındaki herhangi bir .zip (son değiştirilenler önce)
+      1. checkpoints/sac_continue/best.zip → sürekli SAC ajanının kalıcı modeli
+         (start.py her bitişte buraya yazar → sonraki başlatış buradan sürer)
+      2. checkpoints/sac/sac_final.zip → ilk SAC compare_train modeli (%12 başlangıcı)
+      3. checkpoints/ altındaki herhangi bir .zip (son değiştirilenler önce)
     """
-    # 1. population best
-    pop_best = Path(chk_dir) / "best.zip"
-    if pop_best.exists():
-        return str(pop_best)
+    # 1. sürekli SAC ajanı (asıl devam noktası)
+    cont_best = Path(CONTINUE_DIR) / "best.zip"
+    if cont_best.exists():
+        return str(cont_best)
 
-    # 2. DB global best
-    if best_cand:
-        p = Path(best_cand["model_path"])
-        if p.exists():
-            return str(p)
-
-    # 3. SAC final
+    # 2. ilk SAC modeli (compare_train'den, %12 başlangıç)
     sac_final = Path("checkpoints/sac/sac_final.zip")
     if sac_final.exists():
         return str(sac_final)
 
-    # 4. Herhangi bir .zip
+    # 3. herhangi bir .zip (son değiştirilenler önce)
     zips = sorted(
         Path("checkpoints").rglob("*.zip") if Path("checkpoints").exists() else [],
         key=lambda p: p.stat().st_mtime,
@@ -257,16 +245,126 @@ def _print_banner(
     print(f"  Checkpoint  : {resume or '(yok — sıfırdan başlıyor)'}")
     print(f"  Trajectory  : {traj or '(BULUNAMADI!)'}")
     print()
-    print(f"  Ayarlar     : pop={args.pop_size}  gen={args.generations}  "
-          f"steps={args.learn_steps}  eval={args.eval_episodes}")
-    print(f"                async={'Evet' if args.async_train else 'Hayır'}  "
-          f"dashboard={'Evet' if args.dashboard else 'Hayır'}  "
-          f"mutation_std={args.mutation_std}")
+    print(f"  Ayarlar     : steps={args.steps:,}  "
+          f"async={'Evet' if args.async_train else 'Hayır'}  "
+          f"dashboard={'Evet' if args.dashboard else 'Hayır'}")
     print()
-    print(f"  Çalışma mantığı: Her jenerasyon önceki neslin en iyi modelinden")
-    print(f"  başlar ve SAC öğrenmesiyle ilerler. Elit kopyası ile regresyon engellenir.")
+    print(f"  Çalışma mantığı: Tek SAC ajanı en iyi modelden DEVAM eder; baştan")
+    print(f"  başlamaz. Öğrenmesi birikir (%12 → ... → %100), sonra tur süresini")
+    print(f"  kısaltmak için optimizasyon. Ctrl+C ile durdur — ilerleme kaydedilir.")
     print("=" * W)
     print()
+
+
+# ── Sürekli SAC eğitimi ──────────────────────────────────────────────────────
+
+def sac_continue(args) -> None:
+    """
+    Tek, sürekli iyileşen SAC ajanı. Her start.py çalıştırışında:
+      • en iyi modelden (args.resume) DEVAM eder — baştan başlamaz,
+      • varsa deneyim hafızasını (replay buffer) yükler,
+      • kaldığı yerden öğrenir (Ctrl+C veya --steps'e kadar),
+      • bitince modeli + replay buffer'ı CONTINUE_DIR/best.zip'e yazar
+        → sonraki başlatış buradan sürer. Böylece %12 → %25 → ... → %100
+        ve %100 sonrası tur-süresi optimizasyonu kesintisiz birikir.
+    """
+    import time
+    from stable_baselines3 import SAC
+    from stable_baselines3.common.callbacks import CheckpointCallback
+    from ai_driving_logic import TrackmaniaRLEnvironment
+    from async_sac import AsyncSAC
+    from db.experience_store import ExperienceStore
+    from db.callbacks import EpisodeLoggerCallback
+
+    cont_dir = Path(CONTINUE_DIR)
+    cont_dir.mkdir(parents=True, exist_ok=True)
+    best_path = cont_dir / "best.zip"
+    replay_path = cont_dir / "best_replay.pkl"
+
+    # ── Ortam ────────────────────────────────────────────────────────────────
+    env = TrackmaniaRLEnvironment(
+        trajectory_path=args.trajectory,
+        wp_spacing=args.wp_spacing,
+        failure_detection=True,
+    )
+    print("Trackmania'ya bağlanılıyor…")
+    env.reset()
+
+    ModelCls = AsyncSAC if args.async_train else SAC
+    extra = {"max_grad_per_step": args.max_grad_per_step} if args.async_train else {}
+
+    # ── DB ───────────────────────────────────────────────────────────────────
+    store = ExperienceStore(args.db_path)
+    run_id = store.create_run(
+        trajectory_path=args.trajectory, checkpoint_dir=str(cont_dir),
+        total_timesteps=args.steps, resume_path=args.resume,
+        algorithm="sac", notes="sac_continue (sürekli devam)",
+    )
+
+    # ── Model: en iyiden DEVAM ─────────────────────────────────────────────────
+    if args.resume and Path(args.resume).exists():
+        print(f"Devam ediliyor: {args.resume}")
+        model = ModelCls.load(args.resume, env=env, tensorboard_log=args.log_dir, **extra)
+        # Deneyim hafızası varsa yükle (off-policy SAC için sağlıklı devam)
+        if replay_path.exists():
+            try:
+                model.load_replay_buffer(str(replay_path.with_suffix("")))
+                print(f"Deneyim hafızası yüklendi: {model.replay_buffer.size():,} adım")
+            except Exception as exc:  # noqa: BLE001
+                print(f"Replay buffer yüklenemedi (yok sayıldı): {exc}")
+    else:
+        print("Sıfırdan yeni SAC modeli (devam edilecek model bulunamadı).")
+        model = ModelCls(
+            policy="MlpPolicy", env=env, verbose=0, tensorboard_log=args.log_dir,
+            learning_rate=3e-4, buffer_size=200_000, learning_starts=2_000,
+            batch_size=256, tau=0.005, gamma=0.99, train_freq=1,
+            gradient_steps=4, ent_coef="auto", **extra,
+        )
+
+    # ── Callbacks ──────────────────────────────────────────────────────────────
+    callbacks = [
+        EpisodeLoggerCallback(store, run_id, verbose=1),
+        CheckpointCallback(save_freq=args.save_freq, save_path=str(cont_dir),
+                           name_prefix="sac_step", verbose=0),
+    ]
+    dashboard = None
+    if args.dashboard:
+        from ui_dashboard import DashboardCallback
+        dashboard = DashboardCallback(draw_every=args.dashboard_every, verbose=0)
+        callbacks.append(dashboard.sb3_callback)
+
+    # ── Eğit ────────────────────────────────────────────────────────────────────
+    print(f"\nEğitim başlıyor (steps={args.steps:,}). Ctrl+C ile durdurabilirsin.")
+    t0 = time.time()
+    try:
+        model.learn(total_timesteps=args.steps, callback=callbacks,
+                    reset_num_timesteps=False)
+    except KeyboardInterrupt:
+        print("\nEğitim durduruldu (Ctrl+C).")
+    dt = time.time() - t0
+
+    # ── Kaydet: bir sonraki başlatış buradan devam etsin ───────────────────────
+    if dashboard is not None:
+        dashboard.close()
+    model.save(str(best_path.with_suffix("")))
+    try:
+        model.save_replay_buffer(str(replay_path.with_suffix("")))
+    except Exception as exc:  # noqa: BLE001
+        print(f"Replay buffer kaydedilemedi (yok sayıldı): {exc}")
+
+    best = store.best_progress(run_id)
+    best_pct = best["progress_pct"] if best else 0.0
+    print(f"\nBitti ({dt:.0f}s). Bu oturumun en iyi ilerlemesi: {best_pct:.1f}%")
+    print(f"Model kaydedildi: {best_path}  → bir sonraki 'python start.py' buradan devam eder.")
+
+    store.close()
+    env.close()
+    # DB kaybolma ihtimaline karşı local metin log yedeği
+    try:
+        from export_logs import export
+        export(args.db_path, "training_logs")
+    except Exception as exc:  # noqa: BLE001
+        print(f"Log yedeği alınamadı (yok sayıldı): {exc}")
 
 
 # ── Ana akış ─────────────────────────────────────────────────────────────────
@@ -279,27 +377,18 @@ def main() -> None:
     p.add_argument("--trajectory",
                    default=None, metavar="CSV",
                    help="Referans waypoint CSV (otomatik bulunur)")
-    p.add_argument("--pop-size",
-                   type=int, default=_DEFAULT_POP,
-                   help="Jenerasyon başına aday sayısı (1'i daima elit kopyası)")
-    p.add_argument("--generations",
-                   type=int, default=_DEFAULT_GENS,
-                   help="Toplam jenerasyon sayısı")
-    p.add_argument("--learn-steps",
-                   type=int, default=_DEFAULT_STEPS,
-                   help="Her adayın elitten türeyip SAC ile öğreneceği adım sayısı")
-    p.add_argument("--eval-episodes",
-                   type=int, default=_DEFAULT_EVAL_EP,
-                   help="Her adayın puanlanacağı değerlendirme turu sayısı")
-    p.add_argument("--mutation-std",
-                   type=float, default=_DEFAULT_MUT_STD,
-                   help="Aday ağırlıklarına eklenen Gaussian gürültü std (0=kapalı)")
+    p.add_argument("--steps",
+                   type=int, default=1_000_000,
+                   help="Bu oturumda öğrenilecek adım sayısı (Ctrl+C ile erken durdurabilirsin)")
+    p.add_argument("--save-freq",
+                   type=int, default=5_000,
+                   help="Ara checkpoint kayıt sıklığı (adım)")
     p.add_argument("--resume",
                    default=None, metavar="ZIP",
-                   help="Başlangıç eliti checkpoint (otomatik bulunur)")
+                   help="Devam edilecek model (otomatik bulunur — en iyi SAC modeli)")
     p.add_argument("--checkpoint-dir",
                    default=_DEFAULT_CHKDIR,
-                   help="Popülasyon checkpoint klasörü (best.zip burada tutulur)")
+                   help="(kullanılmıyor; sürekli SAC modeli checkpoints/sac_continue/ altında)")
     p.add_argument("--db-path",
                    default=_DEFAULT_DB,
                    help="SQLite veritabanı yolu")
@@ -343,11 +432,10 @@ def main() -> None:
     # ── Özet banner ───────────────────────────────────────────────────────────
     _print_banner(run_list, best_cand, args.resume, args.trajectory, args)
 
-    # ── population_train'e devret ─────────────────────────────────────────────
-    # DashboardCallback population_train içinde oluşturulur (--dashboard=True).
-    # Aynı process — UI + eğitim aynı anda çalışır, ayrı thread gerekmez.
-    from population_train import population_train
-    population_train(args)
+    # ── Sürekli SAC eğitimine devret ──────────────────────────────────────────
+    # Tek SAC ajanı: en iyiden devam eder, öğrenmesi birikir. Dashboard
+    # sac_continue içinde oluşturulur (--dashboard varsayılan açık).
+    sac_continue(args)
 
 
 if __name__ == "__main__":
