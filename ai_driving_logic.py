@@ -239,16 +239,28 @@ class TrackmaniaRLEnvironment(gymnasium.Env):
         trajectory_path: str,
         wp_spacing: float = 1.0,
         failure_detection: bool = True,
-        speed_reward_coef: float = 0.05,
-        crash_penalty: float = 0.3,
+        speed_reward_coef: float = 0.08,   # hıza orantılı ödül (0.05→0.08): araç
+                                           # düzlükte daha hızlı gitsin. straight_scale
+                                           # ile düzlükte tam, virajda kısılır.
+        crash_penalty: float = 0.0,        # çarpma/başarısızlık terminal cezası KAPALI:
+                                           # araç zor köşeyi denemekten caymasın
+                                           # (çarpmak artık "yerinde sallan"dan kötü değil).
         idle_speed_kmh: float = 5.0,
         idle_penalty: float = 1.0,
         low_speed_kmh: float = 30.0,
         low_speed_timeout: float = 3.0,
-        low_speed_penalty: float = 0.3,
+        low_speed_penalty: float = 0.3,    # yavaş sürüş cezası GERİ AÇILDI (0→0.3) ama
+                                           # artık VİRAJ-FARKINDA: straight_scale ile
+                                           # sadece DÜZLÜKTE uygulanır, virajda ~kalkar.
+                                           # Amaç: araç düzlükte sürünmeyi bıraksın
+                                           # (run13'te %80 episode ilk %10'da sürünüp
+                                           # TIMEOUT oluyordu); virajda yavaşlama serbest.
         no_progress_timeout: float = 2.0,
         no_progress_penalty: float = 0.3,
         disable_brake: bool = True,
+        adaptive_zones: bool = True,       # viraj/düzlük bölgesine göre dinamik ceza
+        corner_relief: float = 1.0,        # tam virajda hız-ilişkili cezaların ne kadarı
+                                           # kalkar (1.0 = tamamen; düzlükte cezalar tam).
     ):
         super().__init__()
 
@@ -268,6 +280,8 @@ class TrackmaniaRLEnvironment(gymnasium.Env):
         self._no_progress_start: float = 0.0
         self._last_progress_idx: int = 0
         self._disable_brake = disable_brake
+        self._adaptive_zones = adaptive_zones
+        self._corner_relief = float(corner_relief)
 
         # Bileşenler — connect() / reset() içinde somutlaştırılır
         self._interface = None
@@ -357,7 +371,7 @@ class TrackmaniaRLEnvironment(gymnasium.Env):
             )
             path = processed
 
-        self._tracker = ProgressTracker(path)
+        self._tracker = ProgressTracker(path, adaptive_offtrack=self._adaptive_zones)
 
     # ── Gymnasium API ──────────────────────────────────────────────────────
 
@@ -439,18 +453,26 @@ class TrackmaniaRLEnvironment(gymnasium.Env):
 
         # İlerleme ödülü (+ parkurda kalma) + küçük hız ipucu
         reward = self._tracker.update(frame.x, frame.y, frame.z)
-        reward += self._speed_reward_coef * max(0.0, frame.speed_kmh)
-        # Yerinde durma/sürünme büyük cezası — sallanma tuzağına karşı
+
+        # Dinamik bölge faktörü: 0=düzlük (cezalar tam) … 1=viraj (hız cezaları kalkar).
+        # straight_scale: düzlükte 1.0, virajda (1 - relief). Hız-ilişkili tüm
+        # terimler bununla çarpılır → düzlükte sert, virajda hafif.
+        cf = self._tracker.current_corner_factor if self._adaptive_zones else 0.0
+        straight_scale = 1.0 - cf * self._corner_relief
+
+        reward += self._speed_reward_coef * straight_scale * max(0.0, frame.speed_kmh)
+        # Yerinde durma/sürünme cezası — sallanma tuzağına karşı (virajda hafifler)
         if frame.speed_kmh < self._idle_speed_kmh:
-            reward -= self._idle_penalty
+            reward -= self._idle_penalty * straight_scale
         # Sürekli yavaş sürüş cezası — low_speed_kmh altında low_speed_timeout'tan
-        # uzun kalırsa ceza (kısa yavaşlamalara izin var). Aracı hızlı tutmaya iter.
+        # uzun kalırsa ceza (kısa yavaşlamalara izin var). Düzlükte aracı hızlı tutar,
+        # virajda yavaşlamaya izin verir (straight_scale ile).
         _now = time.time()
         if frame.speed_kmh < self._low_speed_kmh:
             if self._low_speed_start is None:
                 self._low_speed_start = _now
             elif (_now - self._low_speed_start) >= self._low_speed_timeout:
-                reward -= self._low_speed_penalty
+                reward -= self._low_speed_penalty * straight_scale
         else:
             self._low_speed_start = None
         # Yerinde bekleme cezası — parkurda ilerleme (yeni waypoint) yoksa, kısa

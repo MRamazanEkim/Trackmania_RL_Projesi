@@ -42,6 +42,7 @@ import argparse
 import shutil
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 if sys.platform == "win32":
@@ -83,15 +84,18 @@ def _evaluate(model, env, n_episodes: int, dashboard=None) -> dict:
     SAC stochastic policy → deterministic=True ile en iyi (kararlı) sürüş.
     """
     rewards, progress, laps = [], [], []
+    details = []   # her episode için: bitiş sebebi + metrikler (failure analizi için)
     for _ in range(n_episodes):
         obs, _ = env.reset()
         done = False
         ep_reward = 0.0
+        steps = 0
         last_info = {}
         while not done:
             action, _ = model.predict(obs, deterministic=True)
             obs, reward, terminated, truncated, info = env.step(action)
             ep_reward += float(reward)
+            steps += 1
             last_info = info
             done = terminated or truncated
             if dashboard is not None:
@@ -99,10 +103,20 @@ def _evaluate(model, env, n_episodes: int, dashboard=None) -> dict:
         rewards.append(ep_reward)
         progress.append(float(last_info.get("progress_pct", 0.0)))
         laps.append(bool(last_info.get("lap_complete", False)))
+        # Episode neden bitti? truncated (süre/tmrl) ise failure_reason="" → "TIMEOUT/CLEAN"
+        reason = str(last_info.get("failure_reason", "")) or ("LAP" if last_info.get("lap_complete") else "TIMEOUT")
+        details.append({
+            "reward":   ep_reward,
+            "steps":    steps,
+            "furthest": int(last_info.get("waypoint_idx", 0)),
+            "progress": float(last_info.get("progress_pct", 0.0)),
+            "lap":      bool(last_info.get("lap_complete", False)),
+            "reason":   reason,
+        })
 
     if not rewards:
         return {"mean_reward": 0.0, "best_reward": 0.0, "mean_progress": 0.0,
-                "best_progress": 0.0, "eval_episodes": 0, "lap": False}
+                "best_progress": 0.0, "eval_episodes": 0, "lap": False, "details": []}
     return {
         "mean_reward":   float(np.mean(rewards)),
         "best_reward":   float(np.max(rewards)),
@@ -110,6 +124,7 @@ def _evaluate(model, env, n_episodes: int, dashboard=None) -> dict:
         "best_progress": float(np.max(progress)),
         "eval_episodes": len(rewards),
         "lap":           any(laps),
+        "details":       details,
     }
 
 
@@ -127,6 +142,7 @@ def population_train(args: argparse.Namespace):
         trajectory_path=args.trajectory,
         wp_spacing=args.wp_spacing,
         failure_detection=True,
+        adaptive_zones=getattr(args, "adaptive_zones", True),
     )
     print("Trackmania'ya bağlanılıyor…")
     env.reset()
@@ -190,6 +206,7 @@ def population_train(args: argparse.Namespace):
     elite.save(str(best_path))
 
     # ── Jenerasyon döngüsü ───────────────────────────────────────────────────
+    ep_counter = 0   # episodes tablosu için artan episode sayacı (tüm koşu boyunca)
     try:
         for gen in range(args.generations):
             # Jenerasyon başında mevcut en iyiyi göster → "öncekinden öğreniyorum" zinciri
@@ -234,6 +251,21 @@ def population_train(args: argparse.Namespace):
                     model_path=str(cand_path),
                     parent_gen=(gen - 1 if gen > 0 else None),
                 )
+
+                # Her değerlendirme episode'unu episodes tablosuna yaz → episode'ların
+                # NEDEN bittiğini (OFF_TRACK / STUCK / ZERO_SPEED / TIMEOUT / LAP)
+                # sonradan sorgulayabilmek için. failure_reason analizi buradan gelir.
+                for d in s.get("details", []):
+                    ep_counter += 1
+                    store.log_episode(
+                        run_id=run_id, episode_number=ep_counter, global_step=ep_counter,
+                        cumulative_reward=d["reward"], steps=d["steps"],
+                        furthest_waypoint=d["furthest"], progress_pct=d["progress"],
+                        lap_complete=d["lap"], failure_reason=d["reason"],
+                    )
+                reasons = Counter(d["reason"] for d in s.get("details", []))
+                reason_str = " ".join(f"{k}×{v}" for k, v in reasons.most_common())
+
                 # Skor: önce tur, sonra ilerleme, sonra ödül
                 score = (int(s["lap"]), s["best_progress"], s["best_reward"])
                 gen_rows.append((row_id, score, cand_path))
@@ -241,7 +273,7 @@ def population_train(args: argparse.Namespace):
                 tag = "ELİT" if is_elite_clone else f"aday{cand}"
                 print(f"  [{tag}] ilerleme={s['best_progress']:5.1f}%  "
                       f"ödül={s['best_reward']:8.1f}  ep={s['eval_episodes']}  "
-                      f"{'LAP!' if s['lap'] else ''}  ({dt:.0f}s)")
+                      f"{'LAP!' if s['lap'] else ''}  [{reason_str}]  ({dt:.0f}s)")
 
             # ── Neslin kazananı ──────────────────────────────────────────────
             gen_rows.sort(key=lambda r: r[1], reverse=True)
@@ -313,6 +345,10 @@ def _parse_args() -> argparse.Namespace:
                    help="AsyncSAC kullan (eşzamanlı toplama+öğrenme)")
     p.add_argument("--max-grad-per-step", type=float, default=4.0,
                    help="Async modda gradient/adım oranı tavanı")
+    p.add_argument("--no-adaptive-zones", dest="adaptive_zones",
+                   action="store_false", default=True,
+                   help="Viraj/düzlük bölgesine göre uyarlanan dinamik ceza sistemini kapat "
+                        "(varsayılan: açık)")
     p.add_argument("--dashboard", action="store_true",
                    help="Canlı pygame dashboard")
     p.add_argument("--dashboard-every", type=int, default=1,

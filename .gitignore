@@ -38,6 +38,8 @@ Thumbs.db
 checkpoints/
 logs/
 episode_history.json
+model_yedek_*/
+*.zip
 
 # SQLite veritabanı
 *.db

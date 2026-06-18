@@ -293,9 +293,20 @@ class ProgressTracker:
         step_penalty:         float = 0.05,
         search_window:        int   = 300,
         off_track_tolerance:  float = 5.0,
-        off_track_penalty:    float = 0.5,
-        max_stray:            float = 15.0,
+        off_track_penalty:    float = 0.0,   # sapma cezasi KAPALI: zor kosede arac
+                                             # racing line'dan sapmaktan korkmasin,
+                                             # serbestce manevra yapip donmeyi denesin.
+        max_stray:            float = 20.0,  # Bu kadar saparsa "pistten cikti" sayilir
+                                             # ve episode RESTART olur (kullanici istegi).
+                                             # 20m: net off-track'te resetler ama kosede
+                                             # azicik tasip geri donme payi birakir.
         progress_reward_scale: float = 4.0,
+        # ── Dinamik viraj/düzlük bölgeleri (adaptive zones) ──────────────────
+        adaptive_offtrack:    bool  = True,   # virajlarda off-track toleransı/max_stray genişler
+        corner_angle_deg:     float = 8.0,    # waypoint başına bu derece yön değişimi → corner_factor=1
+        corner_dilate:        int   = 12,     # viraj bölgesini ±N waypoint genişlet (giriş+çıkış da viraj sayılır)
+        corner_extra_tol:     float = 4.0,    # tam virajda off-track toleransına eklenen metre
+        corner_extra_stray:   float = 15.0,   # tam virajda max_stray'e eklenen metre (geniş hat payı)
     ):
         self._waypoints: np.ndarray = TrajectoryProcessor.load_raw(trajectory_path)
         self._n         = len(self._waypoints)
@@ -308,6 +319,14 @@ class ProgressTracker:
         self._max_stray = max_stray
         self._prog_scale = progress_reward_scale
 
+        # Dinamik bölge parametreleri + her waypoint için önceden hesaplanan corner_factor
+        self._adaptive          = adaptive_offtrack
+        self._corner_extra_tol  = corner_extra_tol
+        self._corner_extra_stray = corner_extra_stray
+        self._corner_factor = self._compute_corner_factors(
+            self._waypoints, corner_angle_deg, corner_dilate
+        )
+
         # episode state — reset() initialises these
         self._furthest_idx:  int   = 0
         self._lap_complete:  bool  = False
@@ -316,6 +335,47 @@ class ProgressTracker:
         self._nearest_idx:   int   = 0   # last raw nearest (for display)
         self._last_dist:     float = 0.0 # distance to reference line this step
         self._off_track:     bool  = False
+
+    # ── viraj tespiti (geometri tabanlı, baştan hesaplanır) ────────────────
+
+    @staticmethod
+    def _compute_corner_factors(wps: np.ndarray, angle_deg_full: float,
+                                dilate: int) -> np.ndarray:
+        """
+        Her waypoint için corner_factor ∈ [0,1] döndür (0=düzlük, 1=keskin viraj).
+
+        Yöntem: ardışık segmentlerin yön vektörleri arasındaki açı = yerel eğrilik.
+        Açı `angle_deg_full`'e ulaşınca corner_factor=1. Sonra `dilate` kadar
+        kayan-maksimum uygulanır → virajın GİRİŞ ve ÇIKIŞI da viraj sayılır
+        (apex'ten önce yavaşlamaya, sonra hızlanmaya izin için).
+        """
+        n = len(wps)
+        cf = np.zeros(n, dtype=np.float32)
+        if n < 3:
+            return cf
+        seg = np.diff(wps, axis=0)
+        seglen = np.linalg.norm(seg, axis=1, keepdims=True)
+        seglen[seglen < 1e-6] = 1e-6
+        dirs = seg / seglen                          # (n-1, 3) birim yön vektörleri
+        dots = np.clip(np.sum(dirs[:-1] * dirs[1:], axis=1), -1.0, 1.0)
+        ang = np.zeros(n, dtype=np.float32)
+        ang[1:n - 1] = np.degrees(np.arccos(dots))   # iç waypoint'lerde dönüş açısı
+        raw = np.clip(ang / max(angle_deg_full, 1e-6), 0.0, 1.0)
+        # Kayan maksimum (dilation) ile viraj bölgesini genişlet
+        if dilate > 0:
+            out = np.copy(raw)
+            for i in range(n):
+                lo = max(0, i - dilate)
+                hi = min(n, i + dilate + 1)
+                out[i] = raw[lo:hi].max()
+            raw = out
+        return raw.astype(np.float32)
+
+    @property
+    def current_corner_factor(self) -> float:
+        """Aracın şu an bulunduğu (en yakın) waypoint'in viraj faktörü [0,1]."""
+        idx = min(max(self._nearest_idx, 0), self._n - 1)
+        return float(self._corner_factor[idx])
 
     # ── lifecycle ─────────────────────────────────────────────────────────
 
@@ -364,9 +424,14 @@ class ProgressTracker:
         # Off-track penalty: straying from the reference line costs, growing with
         # distance.  This forces the car to TURN with the track instead of driving
         # straight off corners.  Beyond max_stray the episode is flagged off-track.
-        if self._last_dist > self._off_tol:
-            reward -= self._off_pen * (self._last_dist - self._off_tol)
-        self._off_track = self._last_dist > self._max_stray
+        # Dinamik: virajda tolerans + max_stray genişler (geniş hat / savrulma payı),
+        # düzlükte dar kalır (çizgiyi sıkı tut).
+        cf = float(self._corner_factor[self._nearest_idx]) if self._adaptive else 0.0
+        off_tol   = self._off_tol   + cf * self._corner_extra_tol
+        max_stray = self._max_stray + cf * self._corner_extra_stray
+        if self._last_dist > off_tol:
+            reward -= self._off_pen * (self._last_dist - off_tol)
+        self._off_track = self._last_dist > max_stray
 
         # Lap completion bonus (fires at most once per episode)
         if not self._lap_complete:

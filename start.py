@@ -315,6 +315,9 @@ def main() -> None:
     p.add_argument("--max-grad-per-step",
                    type=float, default=4.0,
                    help="Async modda collector/gradient adım oranı tavanı")
+    p.add_argument("--no-adaptive-zones",
+                   dest="adaptive_zones", action="store_false", default=True,
+                   help="Viraj/düzlük bölgesine göre uyarlanan dinamik ceza sistemini kapat")
     p.add_argument("--no-dashboard",
                    dest="dashboard", action="store_false", default=True,
                    help="Pygame dashboard penceresini açma")
