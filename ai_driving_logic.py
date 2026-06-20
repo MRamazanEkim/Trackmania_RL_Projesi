@@ -306,6 +306,54 @@ class TrackmaniaRLEnvironment(gymnasium.Env):
             dtype=np.float32,
         )
 
+    # ── Ödül parametreleri (canlı okunur/güncellenir) ────────────────────────
+    # Tüm bu alanlar step() içinde her adımda yeniden okunur; bu yüzden eğitim
+    # sürerken değiştirilebilirler. StagnationMonitor + RewardAutoTuner, eğitim
+    # tıkandığında (plato) baskın başarısızlık nedenine göre bunları canlı ayarlar.
+    # Sınırlar (clamp): otomatik ayarın kontrolden çıkmasını engeller.
+    _PARAM_BOUNDS = {
+        "speed_reward_coef":  (0.02, 0.25),
+        "idle_penalty":       (0.20, 4.00),
+        "low_speed_penalty":  (0.00, 2.00),
+        "no_progress_penalty": (0.00, 2.00),
+        "crash_penalty":      (0.00, 5.00),
+        "corner_relief":      (0.00, 1.00),
+    }
+    _PARAM_ATTR = {
+        "speed_reward_coef":  "_speed_reward_coef",
+        "idle_penalty":       "_idle_penalty",
+        "low_speed_penalty":  "_low_speed_penalty",
+        "no_progress_penalty": "_no_progress_penalty",
+        "crash_penalty":      "_crash_penalty",
+        "corner_relief":      "_corner_relief",
+    }
+
+    def reward_params(self) -> dict:
+        """Otomatik ayarlanabilir ödül/ceza parametrelerinin anlık değerleri."""
+        return {name: float(getattr(self, attr))
+                for name, attr in self._PARAM_ATTR.items()}
+
+    def apply_reward_adjustment(self, **deltas) -> dict:
+        """
+        Ödül/ceza parametrelerini canlı güncelle (sınırlar içinde clamp'lenir).
+        RewardAutoTuner tarafından, eğitim tıkandığında çağrılır.
+
+        Her parametre çarpan (örn. speed_reward_coef=1.4 → %40 artır) olarak
+        verilir. Değişen alanları {isim: (eski, yeni)} olarak döner.
+        """
+        changes = {}
+        for name, factor in deltas.items():
+            attr = self._PARAM_ATTR.get(name)
+            if attr is None:
+                continue
+            old = float(getattr(self, attr))
+            lo, hi = self._PARAM_BOUNDS[name]
+            new = float(np.clip(old * float(factor), lo, hi))
+            if abs(new - old) > 1e-9:
+                setattr(self, attr, new)
+                changes[name] = (old, new)
+        return changes
+
     # ── Setup ──────────────────────────────────────────────────────────────
 
     def _connect(self):

@@ -59,6 +59,11 @@ from stable_baselines3 import SAC
 from ai_driving_logic import TrackmaniaRLEnvironment
 from async_sac import AsyncSAC
 from db.experience_store import ExperienceStore
+from stagnation_monitor import (
+    StagnationMonitor,
+    RewardAutoTuner,
+    write_stagnation_report,
+)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -205,6 +210,23 @@ def population_train(args: argparse.Namespace):
         print("Başlangıç eliti: sıfırdan rastgele model.")
     elite.save(str(best_path))
 
+    # ── Tıkanma (stagnation) izleyici + ödül auto-tuner ──────────────────────
+    # Uzun koşularda (24 saat) araç bir yerde takılırsa (plato) baskın
+    # başarısızlık nedenine göre ödül/cezayı canlı ayarlar. Ayrıntı:
+    # stagnation_monitor.py ve STAGNASYON_TESPITI.md.
+    monitor = None
+    tuner = None
+    adapt_count = 0
+    if args.stagnation_mode != "off":
+        monitor = StagnationMonitor(
+            patience=args.stagnation_patience,
+            min_delta=args.stagnation_min_delta,
+        )
+        tuner = RewardAutoTuner()
+        print(f"Tıkanma izleyici: mod={args.stagnation_mode} "
+              f"patience={args.stagnation_patience} nesil  "
+              f"min_delta={args.stagnation_min_delta}%")
+
     # ── Jenerasyon döngüsü ───────────────────────────────────────────────────
     ep_counter = 0   # episodes tablosu için artan episode sayacı (tüm koşu boyunca)
     try:
@@ -218,6 +240,7 @@ def population_train(args: argparse.Namespace):
                   f"— aday {1}-{args.pop_size - 1} bu modelden öğrenir")
             print(f"{'='*60}")
             gen_rows = []   # (db_row_id, score_tuple, model_path)
+            gen_reasons = Counter()   # bu neslin tüm adaylarının failure nedenleri
 
             for cand in range(args.pop_size):
                 # Aday modeli: cand 0 = elit kopyası (değişmez), diğerleri mutasyonlu
@@ -264,6 +287,7 @@ def population_train(args: argparse.Namespace):
                         lap_complete=d["lap"], failure_reason=d["reason"],
                     )
                 reasons = Counter(d["reason"] for d in s.get("details", []))
+                gen_reasons.update(reasons)
                 reason_str = " ".join(f"{k}×{v}" for k, v in reasons.most_common())
 
                 # Skor: önce tur, sonra ilerleme, sonra ödül
@@ -293,6 +317,47 @@ def population_train(args: argparse.Namespace):
             summ = store.generation_summary(run_id)
             trend = "  ".join(f"g{r['gen_no']}:{r['gen_best_progress']:.1f}%" for r in summ)
             print(f"  İlerleme trendi: {trend}")
+
+            # ── Tıkanma kontrolü ─────────────────────────────────────────────
+            # En iyi ilerleme bir süredir artmıyorsa (plato): baskın başarısızlık
+            # nedenini teşhis et, rapor yaz, moda göre ödülü ayarla / dur.
+            if monitor is not None:
+                monitor.record(gen, float(global_best["best_progress"]), gen_reasons)
+                if monitor.is_stagnant():
+                    diag = monitor.diagnose()
+                    print(f"\n  ⚠ TIKANMA: {diag.plateau_len} nesildir ilerleme "
+                          f"{diag.plateau_value:.1f}%'de takılı. "
+                          f"Baskın neden: {diag.dominant_reason} "
+                          f"(%{diag.dominant_share*100:.0f})")
+                    suggested = tuner.suggest(diag)
+                    params_before = env.reward_params()
+
+                    if (args.stagnation_mode == "adapt"
+                            and adapt_count < args.stagnation_max_adapts):
+                        changes = env.apply_reward_adjustment(**suggested)
+                        adapt_count += 1
+                        report = write_stagnation_report(
+                            diag, params_before, out_dir=args.analysis_dir,
+                            changes=changes, suggested=suggested)
+                        if changes:
+                            chg = "  ".join(
+                                f"{k}:{old:.3f}→{new:.3f}"
+                                for k, (old, new) in changes.items())
+                            print(f"  ↳ Ödül ayarı #{adapt_count}: {chg}")
+                        else:
+                            print("  ↳ Parametreler zaten sınırda — değişiklik yok.")
+                        print(f"  ↳ Rapor: {report}")
+                        monitor.note_adaptation(changes)
+                    else:
+                        # mode == "stop" VEYA max ayar sayısına ulaşıldı → dur
+                        report = write_stagnation_report(
+                            diag, params_before, out_dir=args.analysis_dir,
+                            suggested=suggested)
+                        reason = ("max ödül ayarı sayısına ulaşıldı"
+                                  if args.stagnation_mode == "adapt"
+                                  else "stagnation-mode=stop")
+                        print(f"  ↳ Eğitim durduruluyor ({reason}). Rapor: {report}")
+                        break
 
     except KeyboardInterrupt:
         print("\nPopülasyon eğitimi kullanıcı tarafından durduruldu.")
@@ -349,6 +414,21 @@ def _parse_args() -> argparse.Namespace:
                    action="store_false", default=True,
                    help="Viraj/düzlük bölgesine göre uyarlanan dinamik ceza sistemini kapat "
                         "(varsayılan: açık)")
+    p.add_argument("--stagnation-mode", choices=["adapt", "stop", "off"],
+                   default="adapt",
+                   help="Tıkanma (plato) davranışı: 'adapt' baskın başarısızlık "
+                        "nedenine göre ödül/cezayı canlı ayarlayıp devam eder; "
+                        "'stop' rapor yazıp eğitimi durdurur; 'off' kapatır")
+    p.add_argument("--stagnation-patience", type=int, default=5,
+                   help="Kaç nesil iyileşme olmazsa tıkanma sayılır")
+    p.add_argument("--stagnation-min-delta", type=float, default=0.5,
+                   help="'İyileşme' sayılması için en iyi ilerlemenin (%) artması "
+                        "gereken en küçük miktar")
+    p.add_argument("--stagnation-max-adapts", type=int, default=6,
+                   help="adapt modunda en fazla kaç kez ödül ayarı yapılır "
+                        "(sonra eğitim durur)")
+    p.add_argument("--analysis-dir", default="analysis",
+                   help="Tıkanma teşhis raporlarının yazılacağı klasör")
     p.add_argument("--dashboard", action="store_true",
                    help="Canlı pygame dashboard")
     p.add_argument("--dashboard-every", type=int, default=1,

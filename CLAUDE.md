@@ -106,6 +106,7 @@ python telemetry_monitor.py --trajectory trajectory_logs/raw_..._reference.csv
 | `db/experience_store.py` | SQLite: `generations` (elitizm) + `episodes` tabloları |
 | `ui_dashboard.py` | Canlı LIDAR radar + telemetri (gömülü `DashboardCallback` veya bağımsız) |
 | `progress_tracker.py` | KDTree tabanlı waypoint ilerleme ödülü — değiştirme |
+| `stagnation_monitor.py` | Uzun koşularda tıkanma tespiti + otomatik ödül ayarı (bkz. `STAGNASYON_TESPITI.md`) |
 | `record_trajectory.py` | Manuel tur kaydı aracı |
 | `telemetry_monitor.py` | tmrl wrapper (`TrackmaniaInterface`) + telemetri loglama |
 | `requirements.txt` | Python bağımlılıkları |

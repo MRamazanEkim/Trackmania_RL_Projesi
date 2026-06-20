@@ -37,6 +37,7 @@ Thumbs.db
 # RL training outputs
 checkpoints/
 logs/
+analysis/
 episode_history.json
 model_yedek_*/
 *.zip
