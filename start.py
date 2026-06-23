@@ -318,6 +318,21 @@ def main() -> None:
     p.add_argument("--no-adaptive-zones",
                    dest="adaptive_zones", action="store_false", default=True,
                    help="Viraj/düzlük bölgesine göre uyarlanan dinamik ceza sistemini kapat")
+    # ── Tıkanma (stagnation) izleyici — population_train ile aynı argümanlar ───
+    # start.py kendi Namespace'ini population_train'e iletir; bu argümanlar
+    # olmazsa population_train args.stagnation_mode'a erişince çöker.
+    p.add_argument("--stagnation-mode", choices=["adapt", "stop", "off"],
+                   default="adapt",
+                   help="Tıkanma davranışı: 'adapt' ödülü canlı ayarlayıp devam eder, "
+                        "'stop' rapor yazıp durur, 'off' kapatır")
+    p.add_argument("--stagnation-patience", type=int, default=5,
+                   help="Kaç nesil iyileşme olmazsa tıkanma sayılır")
+    p.add_argument("--stagnation-min-delta", type=float, default=0.5,
+                   help="'İyileşme' sayılması için ilerlemenin (yüzde puanı) artması gereken miktar")
+    p.add_argument("--stagnation-max-adapts", type=int, default=6,
+                   help="adapt modunda en fazla kaç kez ödül ayarı yapılır")
+    p.add_argument("--analysis-dir", default="analysis",
+                   help="Tıkanma teşhis raporlarının yazılacağı klasör")
     p.add_argument("--no-dashboard",
                    dest="dashboard", action="store_false", default=True,
                    help="Pygame dashboard penceresini açma")
